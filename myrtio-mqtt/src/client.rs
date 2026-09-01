@@ -1,0 +1,459 @@
+//! # The Asynchronous MQTT Client
+//!
+//! This module contains the primary `MqttClient` struct, which manages the state,
+//! connection, and communication with an MQTT broker.
+
+use crate::error::{MqttError, ProtocolError};
+use crate::packet::{self, Connect, EncodePacket, MqttPacket, PingReq, Publish, QoS, Subscribe};
+use crate::transport::{self, MqttTransport};
+use embassy_time::{Duration, Instant, Timer};
+use heapless::{String, Vec};
+
+/// Represents the MQTT protocol version used by the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum MqttVersion {
+    V3,
+    V5,
+}
+
+/// Last Will and Testament configuration for MQTT CONNECT.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct LastWill<'a> {
+    /// Topic the broker will publish to when the client disconnects unexpectedly.
+    pub topic: &'a str,
+    /// Payload the broker will publish on unexpected disconnect.
+    pub payload: &'a [u8],
+    /// QoS for the will publish.
+    pub qos: QoS,
+    /// Retain flag for the will publish.
+    pub retain: bool,
+}
+
+/// Configuration options for the `MqttClient`.
+pub struct MqttOptions<'a> {
+    client_id: &'a str,
+    version: MqttVersion,
+    keep_alive: Duration,
+    clean_session: bool,
+    username: Option<String<32>>,
+    password: Option<String<64>>,
+    will: Option<LastWill<'a>>,
+}
+
+impl<'a> MqttOptions<'a> {
+    pub fn new(client_id: &'a str) -> Self {
+        Self {
+            client_id,
+            version: MqttVersion::V3,
+            keep_alive: Duration::from_secs(60),
+            clean_session: true,
+            username: None,
+            password: None,
+            will: None,
+        }
+    }
+
+    /// Sets the MQTT Clean Session flag.
+    ///
+    /// `false` keeps the broker-side session across reconnects (delivers
+    /// offline QoS1 messages), as required by MXS protocol V2.1.2.
+    pub fn with_clean_session(mut self, clean_session: bool) -> Self {
+        self.clean_session = clean_session;
+        self
+    }
+    #[cfg(feature = "v5")]
+    pub fn with_version(mut self, version: MqttVersion) -> Self {
+        self.version = version;
+        self
+    }
+    pub fn with_keep_alive(mut self, keep_alive: Duration) -> Self {
+        self.keep_alive = keep_alive;
+        self
+    }
+    /// Sets the username and password for MQTT broker authentication.
+    ///
+    /// Username is limited to 32 bytes, password to 64 bytes.
+    pub fn with_credentials(mut self, username: &str, password: &str) -> Self {
+        self.username = String::try_from(username).ok();
+        self.password = String::try_from(password).ok();
+        self
+    }
+
+    /// Sets the MQTT Last Will and Testament message.
+    pub fn with_last_will(mut self, will: LastWill<'a>) -> Self {
+        self.will = Some(will);
+        self
+    }
+}
+
+/// Maximum number of receive attempts when waiting for PUBACK/SUBACK.
+/// Skips interleaved packets (PingResp, Publish). Prevents infinite loop on broken connection.
+const MAX_RECV_ATTEMPTS: usize = 16;
+/// Maximum topic length for runtime-provided Last Will messages.
+const MAX_WILL_TOPIC_LEN: usize = 128;
+/// Maximum payload length for runtime-provided Last Will messages.
+const MAX_WILL_PAYLOAD_LEN: usize = 256;
+
+/// Owned storage for a runtime-provided Last Will message.
+struct OwnedLastWill {
+    topic: String<MAX_WILL_TOPIC_LEN>,
+    payload: Vec<u8, MAX_WILL_PAYLOAD_LEN>,
+    qos: QoS,
+    retain: bool,
+}
+
+/// Represents the current connection state of the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+enum ConnectionState {
+    Disconnected,
+    Connecting,
+    Connected,
+}
+
+/// The asynchronous MQTT client.
+pub struct MqttClient<'a, T, const MAX_TOPICS: usize, const BUF_SIZE: usize>
+where
+    T: MqttTransport,
+{
+    transport: T,
+    options: MqttOptions<'a>,
+    tx_buffer: [u8; BUF_SIZE],
+    rx_buffer: [u8; BUF_SIZE],
+    state: ConnectionState,
+    last_tx_time: Instant,
+    next_packet_id: u16,
+    runtime_will: Option<OwnedLastWill>,
+}
+
+impl<'a, T, const MAX_TOPICS: usize, const BUF_SIZE: usize> MqttClient<'a, T, MAX_TOPICS, BUF_SIZE>
+where
+    T: MqttTransport,
+{
+    pub fn new(transport: T, options: MqttOptions<'a>) -> Self {
+        Self {
+            transport,
+            options,
+            tx_buffer: [0; BUF_SIZE],
+            rx_buffer: [0; BUF_SIZE],
+            state: ConnectionState::Disconnected,
+            last_tx_time: Instant::now(),
+            next_packet_id: 1,
+            runtime_will: None,
+        }
+    }
+
+    /// Sets/overrides the Last Will and Testament for the next connections.
+    ///
+    /// Returns `false` when topic or payload exceed internal fixed buffers.
+    pub fn set_last_will(&mut self, will: LastWill<'_>) -> bool {
+        let mut topic: String<MAX_WILL_TOPIC_LEN> = String::new();
+        if topic.push_str(will.topic).is_err() {
+            return false;
+        }
+
+        let mut payload: Vec<u8, MAX_WILL_PAYLOAD_LEN> = Vec::new();
+        if payload.extend_from_slice(will.payload).is_err() {
+            return false;
+        }
+
+        self.runtime_will = Some(OwnedLastWill {
+            topic,
+            payload,
+            qos: will.qos,
+            retain: will.retain,
+        });
+        true
+    }
+
+    /// Attempts to connect to the MQTT broker.
+    pub async fn connect(&mut self) -> Result<(), MqttError<T::Error>>
+    where
+        T::Error: transport::TransportError,
+    {
+        #[cfg(feature = "esp32-log")]
+        esp_println::println!("MQTT: Starting connect...");
+
+        self.state = ConnectionState::Connecting;
+        let will = if let Some(will) = self.runtime_will.as_ref() {
+            Some(LastWill {
+                topic: will.topic.as_str(),
+                payload: will.payload.as_slice(),
+                qos: will.qos,
+                retain: will.retain,
+            })
+        } else {
+            self.options.will
+        };
+        let connect_packet = Connect::with_credentials(
+            self.options.client_id,
+            self.options.keep_alive.as_secs() as u16,
+            self.options.clean_session,
+            self.options.username.as_deref(),
+            self.options.password.as_ref().map(|s| s.as_bytes()),
+            will,
+        );
+        let len = connect_packet
+            .encode(&mut self.tx_buffer, self.options.version)
+            .map_err(MqttError::cast_transport_error)?;
+
+        #[cfg(feature = "esp32-log")]
+        esp_println::println!("MQTT TX ({} bytes): {:02X?}", len, &self.tx_buffer[..len]);
+
+        self.transport.send(&self.tx_buffer[..len]).await?;
+
+        #[cfg(feature = "esp32-log")]
+        esp_println::println!("MQTT: Waiting for CONNACK...");
+
+        let n = self.transport.recv(&mut self.rx_buffer).await?;
+
+        #[cfg(feature = "esp32-log")]
+        esp_println::println!("MQTT RX ({} bytes): {:02X?}", n, &self.rx_buffer[..n]);
+
+        let packet = packet::decode::<T::Error>(&self.rx_buffer[..n], self.options.version);
+
+        #[cfg(feature = "esp32-log")]
+        if let Err(ref e) = packet {
+            esp_println::println!("MQTT decode error: {:?}", e);
+        }
+
+        let packet = packet?.ok_or(MqttError::Protocol(ProtocolError::InvalidResponse))?;
+
+        if let MqttPacket::ConnAck(connack) = packet {
+            #[cfg(feature = "esp32-log")]
+            esp_println::println!(
+                "MQTT CONNACK: reason_code={}, session_present={}",
+                connack.reason_code,
+                connack.session_present
+            );
+
+            if connack.reason_code == 0 {
+                self.state = ConnectionState::Connected;
+                self.last_tx_time = Instant::now();
+                Ok(())
+            } else {
+                self.state = ConnectionState::Disconnected;
+                Err(MqttError::ConnectionRefused(connack.reason_code.into()))
+            }
+        } else {
+            #[cfg(feature = "esp32-log")]
+            esp_println::println!("MQTT: Expected CONNACK, got different packet!");
+
+            self.state = ConnectionState::Disconnected;
+            Err(MqttError::Protocol(ProtocolError::InvalidResponse))
+        }
+    }
+
+    /// Publishes a message to a topic.
+    pub async fn publish(
+        &mut self,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+    ) -> Result<(), MqttError<T::Error>>
+    where
+        T::Error: transport::TransportError,
+    {
+        self.publish_with_retain(topic, payload, qos, false).await
+    }
+
+    /// Publishes a message to a topic, with explicit retain flag.
+    pub async fn publish_with_retain(
+        &mut self,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        retain: bool,
+    ) -> Result<(), MqttError<T::Error>>
+    where
+        T::Error: transport::TransportError,
+    {
+        if self.state != ConnectionState::Connected {
+            return Err(MqttError::NotConnected);
+        }
+
+        let packet_id = if qos != QoS::AtMostOnce {
+            Some(self.get_next_packet_id())
+        } else {
+            None
+        };
+
+        let publish = Publish {
+            topic,
+            qos,
+            retain,
+            payload,
+            packet_id,
+            #[cfg(feature = "v5")]
+            properties: heapless::Vec::new(),
+        };
+
+        let len = publish
+            .encode(&mut self.tx_buffer, self.options.version)
+            .map_err(MqttError::cast_transport_error)?;
+        self.transport.send(&self.tx_buffer[..len]).await?;
+        self.last_tx_time = Instant::now();
+
+        // Wait for PUBACK if QoS > 0; skip interleaved PingResp/Publish to avoid race with keep-alive
+        if qos != QoS::AtMostOnce {
+            for _ in 0..MAX_RECV_ATTEMPTS {
+                let n = self.transport.recv(&mut self.rx_buffer).await?;
+                let packet =
+                    packet::decode::<T::Error>(&self.rx_buffer[..n], self.options.version)?
+                        .ok_or(MqttError::Protocol(ProtocolError::InvalidResponse))?;
+
+                match packet {
+                    MqttPacket::PubAck(_) => return Ok(()),
+                    MqttPacket::PingResp => continue,
+                    MqttPacket::Publish(_) => continue,
+                    _ => return Err(MqttError::Protocol(ProtocolError::InvalidResponse)),
+                }
+            }
+            return Err(MqttError::Protocol(ProtocolError::InvalidResponse));
+        }
+
+        Ok(())
+    }
+
+    /// Subscribes to a topic with specified QoS.
+    pub async fn subscribe(&mut self, topic: &str, qos: QoS) -> Result<(), MqttError<T::Error>>
+    where
+        T::Error: transport::TransportError,
+    {
+        if self.state != ConnectionState::Connected {
+            return Err(MqttError::NotConnected);
+        }
+
+        let packet_id = self.get_next_packet_id();
+        let subscribe = Subscribe::new(packet_id, topic, qos);
+
+        let len = subscribe
+            .encode(&mut self.tx_buffer, self.options.version)
+            .map_err(MqttError::cast_transport_error)?;
+        self.transport.send(&self.tx_buffer[..len]).await?;
+        self.last_tx_time = Instant::now();
+
+        // Wait for SUBACK; skip interleaved PingResp/Publish to avoid race with keep-alive
+        for _ in 0..MAX_RECV_ATTEMPTS {
+            let n = self.transport.recv(&mut self.rx_buffer).await?;
+            let packet = packet::decode::<T::Error>(&self.rx_buffer[..n], self.options.version)?
+                .ok_or(MqttError::Protocol(ProtocolError::InvalidResponse))?;
+
+            match packet {
+                MqttPacket::SubAck(suback) => {
+                    if suback.packet_id != packet_id {
+                        return Err(MqttError::Protocol(ProtocolError::InvalidResponse));
+                    }
+                    if suback
+                        .reason_codes
+                        .first()
+                        .map(|&c| c >= 0x80)
+                        .unwrap_or(true)
+                    {
+                        return Err(MqttError::Protocol(ProtocolError::InvalidResponse));
+                    }
+                    return Ok(());
+                }
+                MqttPacket::PingResp => continue,
+                MqttPacket::Publish(_) => continue,
+                _ => return Err(MqttError::Protocol(ProtocolError::InvalidResponse)),
+            }
+        }
+        Err(MqttError::Protocol(ProtocolError::InvalidResponse))
+    }
+
+    /// Sends a pre-constructed packet over the transport.
+    async fn _send_packet<P>(&mut self, packet: P) -> Result<(), MqttError<T::Error>>
+    where
+        P: EncodePacket,
+        T::Error: transport::TransportError,
+    {
+        if self.state != ConnectionState::Connected {
+            return Err(MqttError::NotConnected);
+        }
+        let len = packet
+            .encode(&mut self.tx_buffer, self.options.version)
+            .map_err(MqttError::cast_transport_error)?;
+        self.transport.send(&self.tx_buffer[..len]).await?;
+        self.last_tx_time = Instant::now();
+        Ok(())
+    }
+
+    /// Polls the connection for incoming packets and handles keep-alives.
+    ///
+    /// The returned `MqttEvent` contains references to the client's internal receive
+    /// buffer. These references are only valid until the next call to `poll`.
+    pub async fn poll<'p>(&'p mut self) -> Result<Option<MqttEvent<'p>>, MqttError<T::Error>>
+    where
+        T::Error: transport::TransportError,
+    {
+        if self.state != ConnectionState::Connected {
+            return Err(MqttError::NotConnected);
+        }
+
+        let elapsed = self.last_tx_time.elapsed();
+        let remaining = if elapsed >= self.options.keep_alive {
+            Duration::from_millis(0)
+        } else {
+            self.options.keep_alive - elapsed
+        };
+
+        enum PollDecision {
+            Received(usize),
+            KeepAlive,
+        }
+
+        let decision = {
+            let recv_fut = self.transport.recv(&mut self.rx_buffer);
+            let timer_fut = Timer::after(remaining);
+            match futures::future::select(core::pin::pin!(recv_fut), core::pin::pin!(timer_fut))
+                .await
+            {
+                futures::future::Either::Left((result, _)) => result.map(PollDecision::Received),
+                futures::future::Either::Right(((), _pending_recv)) => Ok(PollDecision::KeepAlive),
+            }
+        }?;
+
+        match decision {
+            PollDecision::Received(n) => {
+                if n == 0 {
+                    return Ok(None);
+                }
+
+                let packet =
+                    packet::decode::<T::Error>(&self.rx_buffer[..n], self.options.version)?;
+                if let Some(MqttPacket::Publish(packet)) = packet {
+                    return Ok(Some(MqttEvent::Publish(packet)));
+                }
+
+                Ok(None)
+            }
+            PollDecision::KeepAlive => {
+                #[cfg(feature = "esp32-log")]
+                esp_println::println!("MQTT: Sending PINGREQ");
+                self._send_packet(PingReq).await?;
+                #[cfg(feature = "esp32-log")]
+                esp_println::println!("MQTT: PINGREQ sent");
+                Ok(None)
+            }
+        }
+    }
+
+    fn get_next_packet_id(&mut self) -> u16 {
+        self.next_packet_id = self.next_packet_id.wrapping_add(1);
+        if self.next_packet_id == 0 {
+            self.next_packet_id = 1;
+        }
+        self.next_packet_id
+    }
+}
+
+/// Represents an event received from the MQTT broker.
+/// The lifetime `'p` indicates that the event borrows data from the client's
+/// buffer and is only valid for the duration of the `poll` call.
+#[derive(Debug)]
+pub enum MqttEvent<'p> {
+    Publish(Publish<'p>),
+}

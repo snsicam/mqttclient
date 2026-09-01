@@ -1,0 +1,24 @@
+[package]
+name = "mqtt-client"
+description = "RV1106 MQTT client (MXS protocol V2.1.2) bridging Moonraker/Klipper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+myrtio-mqtt.workspace = true
+embassy-time.workspace = true
+embassy-sync.workspace = true
+embassy-futures.workspace = true
+critical-section.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tungstenite.workspace = true
+log.workspace = true
+env_logger.workspace = true
+ureq = "3"
+futures = "0.3"
+
+[dev-dependencies]

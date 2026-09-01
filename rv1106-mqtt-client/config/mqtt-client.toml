@@ -1,0 +1,40 @@
+# RV1106 MQTT 客户端配置（对应 LLD-003 §9）
+
+[device]
+# 设备 ID：G + 板载序列号（/proc/cpuinfo Serial，如 Ge33700a6620dfddc，构成 topic：GT/MXS/UP/{id}）。
+# 若保持占位值 G000000000000，启动时自动用板载序列号生成并回写。
+id = "G000000000000"
+# 主板型号版本
+mb = "MOTHERBOARD_V1.0"
+# MCU 软件版本
+sf1 = "V1.0.0"
+# ESP 软件版本
+sf2 = "V1.0.0"
+# WIFI 名称（login 上报）
+wf = "PRINTER_WIFI"
+# 语言：0 中文 / 1 非中文
+lang = 0
+
+[mqtt]
+broker = "127.0.0.1"
+port = 1883
+# 心跳（秒），MXS 协议要求 60
+keepalive_secs = 60
+# Clean Session=0：保持会话，重连后可收到离线 QoS1 消息
+clean_session = false
+# 认证（可选）
+# username = "device"
+# password = "secret"
+
+[moonraker]
+# 本机 Klipper 配套 API 服务器
+host = "127.0.0.1"
+port = 7125
+
+[download]
+# U 盘挂载目录
+dir = "/mnt/udisk"
+# 最大下载字节（默认 512MB）
+max_file_bytes = 536870912
+# 下载分块缓冲
+chunk_size = 65536

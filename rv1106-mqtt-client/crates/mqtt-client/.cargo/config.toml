@@ -1,0 +1,7 @@
+# 本机（开发/仿真）构建：默认 host 目标即可。
+# 目标机交叉编译（RV1106，armv7l）示例：
+#   [build]
+#   target = "armv7-unknown-linux-gnueabihf"
+#   [target.armv7-unknown-linux-gnueabihf]
+#   linker = "arm-rockchip830-linux-uclibcgnueabihf-gcc"
+# 详见 docs/详细设计说明书.md §10 交叉编译。

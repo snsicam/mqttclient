@@ -1,0 +1,27 @@
+# RV1106 交叉编译配置（Luckfox Pico / Rockchip 830，uclibc 工具链）
+#
+# 目标概要：
+#   - 芯片：Rockchip RV1106 (armv7l, hard-float, Cortex-A7)
+#   - 根文件系统：uclibc（Luckfox 官方镜像）
+#   - 工具链：arm-rockchip830-linux-uclibcgnueabihf（Luckfox 提供）
+#
+# Rust 官方无 armv7-*-uclibceabihf target，采用标准 target
+# `armv7-unknown-linux-gnueabihf` + Rockchip uclibc 工具链作为 linker，
+# 由 uclibc 的 gcc 提供正确的 CRT / libc 链接与 sysroot。
+# （uclibc 提供 glibc 兼容符号子集，gnueabihf 目标产物可在 uclibc rootfs 运行。）
+
+[target.armv7-unknown-linux-gnueabihf]
+linker = "arm-rockchip830-linux-uclibcgnueabihf-gcc"
+rustflags = [
+  "-C", "linker-flavor=gcc",
+  "-C", "target-cpu=cortex-a7",
+  "-C", "link-arg=--sysroot=/home/song/samba/work/rv1106/luckfox-pico/tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf/arm-rockchip830-linux-uclibcgnueabihf/sysroot",
+  "-C", "link-arg=-L/home/song/samba/work/rv1106/luckfox-pico/tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf/arm-rockchip830-linux-uclibcgnueabihf/sysroot/usr/lib",
+  # getauxval 桩（uclibc 1.0.31 不导出该符号，被 Rust std 栈溢出保护与 ring 0.17 调用）
+  "-C", "link-arg=-L/home/song/samba/work/project/klipper/mqttclient/rv1106-mqtt-client/cross",
+  "-C", "link-arg=-lgetauxval",
+]
+
+[build]
+# 确保工具链在 PATH 中（若未全局安装，可在此用 target.<triple> 的 linker 绝对路径，
+# 或 source 工具链 env）。此处依赖 linker 名称已在 PATH。

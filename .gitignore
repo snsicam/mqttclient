@@ -1,0 +1,30 @@
+# ===== 构建产物 =====
+target/
+*.o
+*.d
+*.rlib
+*.rmeta
+*.timestamp
+*.bin
+*.elf
+
+# ===== 外部仓库符号链接（不纳入本仓）=====
+/guppyscreen
+/rust-libp2p
+
+# ===== 日志 =====
+log.txt
+*.log
+
+# ===== 编辑器 / 工具 =====
+.vscode/
+.idea/
+.codebuddy/
+*.swp
+
+# ===== 子仓 .git 备份（保留历史，不纳入本仓）=====
+**/.git.bak/
+
+# ===== 系统 =====
+.DS_Store
+Thumbs.db
