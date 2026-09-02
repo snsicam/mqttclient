@@ -1,0 +1,3 @@
+[submodule "myrtio-mqtt"]
+	path = myrtio-mqtt
+	url = git@github.com:snsicam/myrtio-mqtt.git

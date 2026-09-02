@@ -10,10 +10,10 @@ target/
 
 # ===== 独立仓库 / 外部项目（不纳入本仓）=====
 # 这些目录自带 .git 或为外部符号链接，各自独立版本管理
+# 注：myrtio-mqtt 已改为 submodule，不在此排除
 /guppyscreen
 /rust-libp2p
 /m2-software
-/myrtio-mqtt
 
 # ===== 日志 =====
 log.txt
