@@ -8,10 +8,12 @@ target/
 *.bin
 *.elf
 
-# ===== 外部仓库符号链接（不纳入本仓）=====
+# ===== 独立仓库 / 外部项目（不纳入本仓）=====
+# 这些目录自带 .git 或为外部符号链接，各自独立版本管理
 /guppyscreen
 /rust-libp2p
 /m2-software
+/myrtio-mqtt
 
 # ===== 日志 =====
 log.txt
