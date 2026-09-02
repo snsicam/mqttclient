@@ -29,6 +29,37 @@ impl Default for AppConfig {
 /// 占位设备 ID：读不到板载序列号时的兜底值。
 pub const PLACEHOLDER_DEVICE_ID: &str = "G000000000000";
 
+/// 设备型号常量定义宏。
+///
+/// 用法：`define_model!(MODEL_M1S, "M1S");` → 生成 `pub const MODEL_M1S: &str = "M1S";`
+/// 集中管理型号字面量，新增型号只需加一行，避免字符串散落。
+macro_rules! define_model {
+    ($name:ident, $lit:literal) => {
+        pub const $name: &str = $lit;
+    };
+}
+
+// ---- 型号清单（新增型号在此追加一行）----
+define_model!(MODEL_M1S, "M1S");
+
+/// 默认设备型号（Topic 中的型号字段）。
+///
+/// 实际型号由配置文件 `[mqtt] model` 决定（见 `MqttConfig::model`），
+/// 未配置时取 `MODEL_M1S`，最终 topic 形如 `GT/{model}/UP/{deviceId}`。
+pub const DEFAULT_MODEL: &str = MODEL_M1S;
+
+/// Topic 品牌根（协议固定前缀）。
+pub const TOPIC_ROOT: &str = "GT";
+
+/// Topic 生成宏：`mqtt_topic!(model, "UP", id)` → `"GT/M1S/UP/{id}"`。
+///
+/// 统一 topic 拼装，避免各处硬编码 `GT/...` 前缀。
+macro_rules! mqtt_topic {
+    ($model:expr, $dir:literal, $id:expr) => {
+        format!("{}/{}/{}/{}", $crate::config::TOPIC_ROOT, $model, $dir, $id)
+    };
+}
+
 /// 读取板载序列号。
 ///
 /// Linux 下从 `/proc/cpuinfo` 的 `Serial` 字段读取（单板机每块唯一，
@@ -100,16 +131,20 @@ impl Default for DeviceConfig {
 pub struct MqttConfig {
     pub broker: String,
     pub port: u16,
-    /// MQTT 心跳（秒），MXS 要求 60。
+    /// MQTT 心跳（秒），协议要求 60。
     #[serde(default = "default_keepalive")]
     pub keepalive_secs: u16,
-    /// Clean Session：false = 保持会话（MXS 要求 Clean Session 0）。
+    /// Clean Session：false = 保持会话（协议要求 Clean Session 0）。
     #[serde(default)]
     pub clean_session: bool,
     #[serde(default)]
     pub username: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
+    /// 设备型号：构成 topic `GT/{model}/UP|DOWN|LWT/{deviceId}`。
+    /// 未配置时取 `DEFAULT_MODEL`（M1S）。改此值即可切换型号，无需重新编译。
+    #[serde(default = "default_model")]
+    pub model: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -144,6 +179,7 @@ impl Default for MqttConfig {
             clean_session: false,
             username: None,
             password: None,
+            model: default_model(),
         }
     }
 }
@@ -160,6 +196,8 @@ impl Default for DownloadConfig {
 
 fn default_lang() -> u8 { 0 }
 fn default_keepalive() -> u16 { 60 }
+/// 默认设备型号（未配置 `[mqtt] model` 时使用）。
+fn default_model() -> String { DEFAULT_MODEL.to_string() }
 fn default_mr_host() -> String { "127.0.0.1".into() }
 fn default_mr_port() -> u16 { 7125 }
 fn default_dl_dir() -> String { "/mnt/udisk".into() }
@@ -231,9 +269,12 @@ impl AppConfig {
             .ok_or_else(|| ConfigError::Invalid("broker 无可用地址".into()))
     }
 
-    pub fn up_topic(&self) -> String { format!("GT/MXS/UP/{}", self.device.id) }
-    pub fn down_topic(&self) -> String { format!("GT/MXS/DOWN/{}", self.device.id) }
-    pub fn lwt_topic(&self) -> String { format!("GT/MXS/LWT/{}", self.device.id) }
+    pub fn up_topic(&self) -> String { mqtt_topic!(self.mqtt.model, "UP", self.device.id) }
+    pub fn down_topic(&self) -> String { mqtt_topic!(self.mqtt.model, "DOWN", self.device.id) }
+    pub fn lwt_topic(&self) -> String { mqtt_topic!(self.mqtt.model, "LWT", self.device.id) }
+    /// Topic 根前缀：`{TOPIC_ROOT}/{model}`（如 `GT/M1S`）。
+    pub fn topic_prefix(&self) -> String { format!("{TOPIC_ROOT}/{}", self.mqtt.model) }
+
     pub fn moonraker_ws_url(&self) -> String {
         format!("ws://{}:{}/websocket", self.moonraker.host, self.moonraker.port)
     }
@@ -271,10 +312,41 @@ dir = "/mnt/udisk"
         assert_eq!(cfg.device.id, "G1234");
         assert!(!cfg.mqtt.clean_session);
         assert_eq!(cfg.moonraker.port, 7125);
-        assert_eq!(cfg.up_topic(), "GT/MXS/UP/G1234");
-        assert_eq!(cfg.down_topic(), "GT/MXS/DOWN/G1234");
-        assert_eq!(cfg.lwt_topic(), "GT/MXS/LWT/G1234");
+        // 未配置 model 时取默认型号 DEFAULT_MODEL（M1S）
+        assert_eq!(cfg.mqtt.model, DEFAULT_MODEL);
+        assert_eq!(cfg.up_topic(), mqtt_topic!(cfg.mqtt.model, "UP", "G1234"));
+        assert_eq!(cfg.down_topic(), mqtt_topic!(cfg.mqtt.model, "DOWN", "G1234"));
+        assert_eq!(cfg.lwt_topic(), mqtt_topic!(cfg.mqtt.model, "LWT", "G1234"));
+        assert_eq!(cfg.topic_prefix(), format!("{TOPIC_ROOT}/{DEFAULT_MODEL}"));
         assert!(cfg.validate().is_ok());
+    }
+
+    /// 配置 `[mqtt] model` 应能改变 topic（型号配置化，无需重新编译）。
+    #[test]
+    fn model_config_changes_topic() {
+        let text = r#"
+[device]
+id = "G1234"
+mb = "MB"
+sf1 = "1.0"
+sf2 = "1.0"
+wf = "W"
+
+[mqtt]
+broker = "127.0.0.1"
+port = 1883
+model = "M2"
+
+[moonraker]
+host = "127.0.0.1"
+port = 7125
+"#;
+        let cfg: AppConfig = toml::from_str(text).expect("parse");
+        assert_eq!(cfg.mqtt.model, "M2");
+        assert_eq!(cfg.up_topic(), "GT/M2/UP/G1234");
+        assert_eq!(cfg.down_topic(), "GT/M2/DOWN/G1234");
+        assert_eq!(cfg.lwt_topic(), "GT/M2/LWT/G1234");
+        assert_eq!(cfg.topic_prefix(), "GT/M2");
     }
 
     #[test]

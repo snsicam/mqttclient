@@ -102,10 +102,10 @@ impl UplinkMsg {
     }
 
     /// alarm：设备告警（errType 1~20）。
-    pub fn alarm(err_type: u8, err_msg: &str, ts: u64) -> Vec<u8> {
+    pub fn alarm(id: &str, err_type: u8, err_msg: &str, ts: u64) -> Vec<u8> {
         json_to_bytes(json!({
             "type": "alarm",
-            "id": "",
+            "id": id,
             "errType": err_type,
             "errMsg": err_msg,
             "ts": ts,
@@ -113,10 +113,10 @@ impl UplinkMsg {
     }
 
     /// status_hardware：硬件状态（runout/beep/light/Breathing/sd/level/door）。
-    pub fn status_hardware(s: &crate::AppState, ts: u64) -> Vec<u8> {
+    pub fn status_hardware(id: &str, s: &crate::AppState, ts: u64) -> Vec<u8> {
         json_to_bytes(json!({
             "type": "status_hardware",
-            "id": "",
+            "id": id,
             "runout": if s.runout { 1 } else { 0 },
             "beep": if s.beep { 1 } else { 0 },
             "light": if s.light { 1 } else { 0 },
@@ -129,10 +129,10 @@ impl UplinkMsg {
     }
 
     /// status_temp_fan：温度与风扇。
-    pub fn status_temp_fan(s: &crate::AppState, ts: u64) -> Vec<u8> {
+    pub fn status_temp_fan(id: &str, s: &crate::AppState, ts: u64) -> Vec<u8> {
         json_to_bytes(json!({
             "type": "status_temp_fan",
-            "id": "",
+            "id": id,
             "preheatType": s.preheat_type,
             "preheatState": s.preheat_state,
             "heatState": s.heat_state,
@@ -148,10 +148,10 @@ impl UplinkMsg {
     }
 
     /// status_level：调平状态。
-    pub fn status_level(s: &crate::AppState, ts: u64) -> Vec<u8> {
+    pub fn status_level(id: &str, s: &crate::AppState, ts: u64) -> Vec<u8> {
         json_to_bytes(json!({
             "type": "status_level",
-            "id": "",
+            "id": id,
             "levelingStatus": s.leveling_status,
             "levelingPoint": s.leveling_point,
             "levelingTotalPoints": s.leveling_total,
@@ -160,12 +160,12 @@ impl UplinkMsg {
     }
 
     /// status_print：打印状态（elapsed/remain 拆分为 h/m/s）。
-    pub fn status_print(s: &crate::AppState, ts: u64) -> Vec<u8> {
+    pub fn status_print(id: &str, s: &crate::AppState, ts: u64) -> Vec<u8> {
         let el = split_hms(s.print_elapsed_secs);
         let rm = split_hms(s.print_remain_secs);
         json_to_bytes(json!({
             "type": "status_print",
-            "id": "",
+            "id": id,
             "printState": s.print_state,
             "zOffset": s.zoffset_x100,
             "printProgress": s.print_progress,
@@ -177,10 +177,10 @@ impl UplinkMsg {
     }
 
     /// gcode：执行结果回复。
-    pub fn gcode_reply(cmd_type: &str, exec_result: &str, ts: u64) -> Vec<u8> {
+    pub fn gcode_reply(id: &str, cmd_type: &str, exec_result: &str, ts: u64) -> Vec<u8> {
         json_to_bytes(json!({
             "type": "gcode",
-            "id": "",
+            "id": id,
             "cmdType": cmd_type,
             "execResult": exec_result,
             "ts": ts,
@@ -188,10 +188,10 @@ impl UplinkMsg {
     }
 
     /// download_begin 回复 / download_end 上报。
-    pub fn download_report(kind: &str, file_name: &str, file_type: u8, trans_state: &str, err_code: u8, ts: u64) -> Vec<u8> {
+    pub fn download_report(id: &str, kind: &str, file_name: &str, file_type: u8, trans_state: &str, err_code: u8, ts: u64) -> Vec<u8> {
         json_to_bytes(json!({
             "type": kind,
-            "id": "",
+            "id": id,
             "fileName": file_name,
             "fileType": file_type,
             "transState": trans_state,
@@ -201,19 +201,19 @@ impl UplinkMsg {
     }
 
     /// device_unbind：设备解绑（上行）。
-    pub fn device_unbind(ts: u64) -> Vec<u8> {
-        json_to_bytes(json!({ "type": "device_unbind", "id": "", "ts": ts }))
+    pub fn device_unbind(id: &str, ts: u64) -> Vec<u8> {
+        json_to_bytes(json!({ "type": "device_unbind", "id": id, "ts": ts }))
     }
 
     /// file_list：文件列表回复（分片，fileIndex 从 0 起）。
-    pub fn file_list_reply(file_total: usize, file_index: usize, files: &[(String, u64)], ts: u64) -> Vec<u8> {
+    pub fn file_list_reply(id: &str, file_total: usize, file_index: usize, files: &[(String, u64)], ts: u64) -> Vec<u8> {
         let list: Vec<Value> = files
             .iter()
             .map(|(n, sz)| json!({ "fileName": n, "fileSize": sz }))
             .collect();
         json_to_bytes(json!({
             "type": "file_list",
-            "id": "",
+            "id": id,
             "fileTotal": file_total,
             "fileIndex": file_index,
             "fileList": list,
@@ -222,8 +222,8 @@ impl UplinkMsg {
     }
 
     /// upgrade_query：设备发起升级查询。
-    pub fn upgrade_query(ts: u64) -> Vec<u8> {
-        json_to_bytes(json!({ "type": "upgrade_query", "id": "", "ts": ts }))
+    pub fn upgrade_query(id: &str, ts: u64) -> Vec<u8> {
+        json_to_bytes(json!({ "type": "upgrade_query", "id": id, "ts": ts }))
     }
 }
 
@@ -273,7 +273,8 @@ mod tests {
     #[test]
     fn build_status_hardware() {
         let s = AppState { runout: true, beep: false, light: true, breathing: false, sd_ok: true, level_ok: false, door_open: true, ..Default::default() };
-        let v: Value = serde_json::from_slice(&UplinkMsg::status_hardware(&s, 7)).unwrap();
+        let v: Value = serde_json::from_slice(&UplinkMsg::status_hardware("G9", &s, 7)).unwrap();
+        assert_eq!(v["id"], "G9"); // id 必须带设备号，否则平台无法识别来源
         assert_eq!(v["runout"], 1);
         assert_eq!(v["Breathing"], 0); // 协议字段名保持大写 B
         assert_eq!(v["sd"], 1);
@@ -283,7 +284,8 @@ mod tests {
     #[test]
     fn build_status_print_hms() {
         let s = AppState { print_state: 1, print_elapsed_secs: 3661, print_remain_secs: 61, print_progress: 50, current_file: "x.gcode".into(), zoffset_x100: -15, ..Default::default() };
-        let v: Value = serde_json::from_slice(&UplinkMsg::status_print(&s, 0)).unwrap();
+        let v: Value = serde_json::from_slice(&UplinkMsg::status_print("G9", &s, 0)).unwrap();
+        assert_eq!(v["id"], "G9");
         assert_eq!(v["printState"], 1);
         assert_eq!(v["printElapsedTime"]["hour"], 1);
         assert_eq!(v["printElapsedTime"]["min"], 1);
@@ -296,7 +298,8 @@ mod tests {
     #[test]
     fn build_file_list_reply() {
         let files = vec![("a.gcode".to_string(), 100u64), ("b.gcode".to_string(), 200u64)];
-        let v: Value = serde_json::from_slice(&UplinkMsg::file_list_reply(2, 0, &files, 3)).unwrap();
+        let v: Value = serde_json::from_slice(&UplinkMsg::file_list_reply("G9", 2, 0, &files, 3)).unwrap();
+        assert_eq!(v["id"], "G9");
         assert_eq!(v["fileTotal"], 2);
         assert_eq!(v["fileIndex"], 0);
         assert_eq!(v["fileList"][0]["fileName"], "a.gcode");

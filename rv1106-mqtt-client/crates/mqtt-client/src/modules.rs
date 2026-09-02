@@ -126,18 +126,26 @@ impl AppModule {
         self.force_publish = true;
     }
 
+    /// 发布并记录调试日志（topic + payload 文本）。
+    fn publish_dbg(&self, outbox: &mut dyn PublishOutbox, topic: &str, payload: &[u8]) {
+        log::info!("UP   topic={topic} qos=AtLeastOnce payload={}",
+            String::from_utf8_lossy(payload));
+        outbox.publish(topic, payload, QoS::AtLeastOnce);
+    }
+
     fn publish_status_packs(&mut self, outbox: &mut dyn PublishOutbox) {
         let topic = self.cfg.up_topic();
         let s = self.state.lock().unwrap().clone();
         let now = protocol::now_ts();
+        let id = self.cfg.device.id.as_str();
         let packs = [
-            UplinkMsg::status_hardware(&s, now),
-            UplinkMsg::status_temp_fan(&s, now),
-            UplinkMsg::status_level(&s, now),
-            UplinkMsg::status_print(&s, now),
+            UplinkMsg::status_hardware(id, &s, now),
+            UplinkMsg::status_temp_fan(id, &s, now),
+            UplinkMsg::status_level(id, &s, now),
+            UplinkMsg::status_print(id, &s, now),
         ];
         for p in packs {
-            outbox.publish(&topic, &p, QoS::AtLeastOnce);
+            self.publish_dbg(outbox, &topic, &p);
         }
     }
 
@@ -164,24 +172,24 @@ impl AppModule {
                     self.state.lock().unwrap().moonraker_connected = false;
                 }
                 Event::GcodeResult { cmd_type, result } => {
-                    self.enqueue(0, UplinkMsg::gcode_reply(&cmd_type, &result, now));
+                    self.enqueue(0, UplinkMsg::gcode_reply(&self.cfg.device.id, &cmd_type, &result, now));
                 }
                 Event::DownloadFinished { file_type, file_name, err_code } => {
                     let st = if err_code == 0 { "OK" } else { "ERROR" };
-                    self.enqueue(0, UplinkMsg::download_report("download_end", &file_name, file_type, st, err_code, now));
+                    self.enqueue(0, UplinkMsg::download_report(&self.cfg.device.id, "download_end", &file_name, file_type, st, err_code, now));
                 }
                 Event::FileListResult { files } => {
                     let total = files.len();
                     if total == 0 {
-                        self.enqueue(0, UplinkMsg::file_list_reply(0, 0, &[], now));
+                        self.enqueue(0, UplinkMsg::file_list_reply(&self.cfg.device.id, 0, 0, &[], now));
                     } else {
                         for (i, chunk) in files.chunks(10).enumerate() {
-                            self.enqueue(0, UplinkMsg::file_list_reply(total, i, chunk, now));
+                            self.enqueue(0, UplinkMsg::file_list_reply(&self.cfg.device.id, total, i, chunk, now));
                         }
                     }
                 }
                 Event::Alarm { err_type, err_msg } => {
-                    self.enqueue(0, UplinkMsg::alarm(err_type, &err_msg, now));
+                    self.enqueue(0, UplinkMsg::alarm(&self.cfg.device.id, err_type, &err_msg, now));
                 }
             }
         }
@@ -197,12 +205,13 @@ impl AppModule {
                 self.mods.login.reply_received = true;
                 self.mods.login.bind_state = bind;
                 self.mods.login.account = msg.account.clone().unwrap_or_default();
-                if bind == 1 {
+                // 协议：bindState 0=已绑定 / 1=未绑定 / 2=序列号未录入（与 ConnStateMachine::bound 一致）
+                if bind == 0 {
                     log::info!("login ok, bound");
                     self.force_publish = true;
                 } else {
-                    log::warn!("login reply: not bound ({bind})");
-                    self.enqueue(0, UplinkMsg::device_unbind(now));
+                    // 0 以外均视为未完成绑定：不上报状态，等待平台侧录入/绑定
+                    log::warn!("login reply: not bound (bindState={bind})");
                 }
             }
             "status_query" => {
@@ -266,12 +275,16 @@ impl MqttModule for AppModule {
         let ip = local_ip().unwrap_or_default();
         let payload = UplinkMsg::login(&self.cfg.device, &ip, now);
         let topic = self.cfg.up_topic();
-        outbox.publish(&topic, &payload, QoS::AtLeastOnce);
+        self.publish_dbg(outbox, &topic, &payload);
         self.conn.on_login_sent(now);
         log::info!("login published (attempt {})", self.conn.login_attempts);
     }
 
     fn on_message(&mut self, message: &Publish<'_>) {
+        log::info!("DOWN topic={} qos={:?} payload={}",
+            message.topic,
+            message.qos,
+            String::from_utf8_lossy(message.payload));
         match DownlinkMsg::parse(message.payload) {
             Ok(msg) => self.handle_downlink(&msg),
             Err(e) => log::warn!("bad downlink payload: {e}"),
@@ -299,7 +312,7 @@ impl MqttModule for AppModule {
         }
 
         // 4. 周期状态上报（忙 10s / 闲 5min）
-        if self.conn.state == ConnState::Ready {
+        if self.conn.state == ConnState::Ready && self.conn.bound {
             let busy = self.state.lock().unwrap().is_busy();
             let interval = if busy { STATUS_BUSY_INTERVAL_SECS } else { STATUS_IDLE_INTERVAL_SECS };
             if now.saturating_sub(self.conn.last_status_publish_ts) >= interval {
@@ -309,11 +322,17 @@ impl MqttModule for AppModule {
         }
 
         // 5. FIFO 出队发布
-        let topic = self.cfg.up_topic();
-        while let Some(item) = self.fifo.pop() {
-            outbox.publish(&topic, &item.payload, QoS::AtLeastOnce);
+        //
+        // 未绑定（bindState 非 0）时不出队：对齐 m2-software 参考实现
+        // （`wifi_send_dev_state_cycle()` 首行 `login_success_flag == false` 即 return，
+        //  未绑定时状态包只堆积在 FIFO，不对外发送）。
+        if self.conn.bound {
+            let topic = self.cfg.up_topic();
+            while let Some(item) = self.fifo.pop() {
+                self.publish_dbg(outbox, &topic, &item.payload);
+            }
+            self.force_publish = false;
         }
-        self.force_publish = false;
 
         TICK_INTERVAL
     }
@@ -334,6 +353,17 @@ pub fn local_ip() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 记录所有 publish 调用，供测试断言。
+    #[derive(Default)]
+    struct Recorder {
+        items: Vec<(String, Vec<u8>)>,
+    }
+    impl PublishOutbox for Recorder {
+        fn publish(&mut self, topic: &str, payload: &[u8], _qos: QoS) {
+            self.items.push((topic.to_string(), payload.to_vec()));
+        }
+    }
 
     fn test_module() -> (AppModule, mpsc::Sender<Event>) {
         let cfg = AppConfig {
@@ -371,6 +401,25 @@ mod tests {
         assert!(m.force_publish);
     }
 
+    /// 回归：bindState 语义 0=已绑定 / 1=未绑定 / 2=未录入。
+    /// 曾误判为 `bind == 1` 才绑定，导致 0 时反而发解绑包。
+    #[test]
+    fn downlink_login_bindstate_semantics() {
+        // bindState=1（未绑定）：状态机进 Ready 但 bound=false，且不触发状态上报
+        let (mut m, _tx) = test_module();
+        m.handle_downlink(&DownlinkMsg::parse(br#"{"type":"login","bindState":1}"#).unwrap());
+        assert_eq!(m.conn.state, ConnState::Ready);
+        assert!(!m.conn.bound, "bindState=1 应为未绑定");
+        assert!(!m.force_publish, "未绑定时不应触发状态上报");
+        assert!(m.fifo.is_empty(), "未绑定时不应发 device_unbind");
+
+        // bindState=2（未录入）：同样未绑定
+        let (mut m2, _tx2) = test_module();
+        m2.handle_downlink(&DownlinkMsg::parse(br#"{"type":"login","bindState":2}"#).unwrap());
+        assert!(!m2.conn.bound, "bindState=2 应为未绑定");
+        assert!(m2.fifo.is_empty());
+    }
+
     #[test]
     fn downlink_status_query_forces_publish() {
         let (mut m, _tx) = test_module();
@@ -387,5 +436,30 @@ mod tests {
         m.drain_events();
         assert!(!m.fifo.is_empty());
         assert!(m.needs_immediate_publish());
+    }
+
+    /// 未绑定（bindState 非 0）时不得对外发送状态包与 FIFO 包。
+    /// 对齐 m2-software：未绑定时包只留在 FIFO，不 publish。
+    #[test]
+    fn unbound_device_does_not_publish() {
+        let (mut m, _tx) = test_module();
+        // 置为未绑定（bindState=1）
+        m.handle_downlink(&DownlinkMsg::parse(br#"{"type":"login","bindState":1}"#).unwrap());
+        assert!(!m.conn.bound);
+        // 入队一个业务包，并触发周期上报时间点
+        m.enqueue(0, b"{\"type\":\"alarm\"}".to_vec());
+        m.conn.last_status_publish_ts = 0;
+
+        let mut outbox = Recorder::default();
+        m.on_tick(&mut outbox);
+        assert!(outbox.items.is_empty(), "未绑定时不应发布任何包");
+        assert!(!m.fifo.is_empty(), "未绑定时包应留在 FIFO 中");
+
+        // 绑定后（bindState=0）应恢复发布
+        m.handle_downlink(&DownlinkMsg::parse(br#"{"type":"login","bindState":0}"#).unwrap());
+        assert!(m.conn.bound);
+        let mut outbox2 = Recorder::default();
+        m.on_tick(&mut outbox2);
+        assert!(!outbox2.items.is_empty(), "绑定后应恢复发布");
     }
 }

@@ -66,10 +66,28 @@ impl StdTcpTransport {
     }
 }
 
+/// 把缓冲区渲染成调试文本：可打印内容原样输出，否则输出 hex 摘要。
+fn debug_bytes(tag: &str, buf: &[u8]) {
+    if !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+    const MAX_SHOW: usize = 256;
+    let shown = &buf[..buf.len().min(MAX_SHOW)];
+    let text = match std::str::from_utf8(shown) {
+        Ok(s) if s.chars().all(|c| !c.is_control()) => s.to_string(),
+        _ => {
+            let hex: String = shown.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+            format!("[hex {len}B] {hex}", len = buf.len())
+        }
+    };
+    log::debug!("{tag} {len}B: {text}", len = buf.len());
+}
+
 impl MqttTransport for StdTcpTransport {
     type Error = StdError;
 
     async fn send(&mut self, buf: &[u8]) -> Result<(), StdError> {
+        debug_bytes("MQTT >>", buf);
         let stream = self.stream.as_mut().ok_or(StdError::NotConnected)?;
         let mut written = 0usize;
         while written < buf.len() {
@@ -88,17 +106,19 @@ impl MqttTransport for StdTcpTransport {
 
     async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, StdError> {
         let stream = self.stream.as_mut().ok_or(StdError::NotConnected)?;
-        loop {
+        let n = loop {
             match stream.read(buf) {
                 Ok(0) => return Err(StdError::ConnectionClosed),
-                Ok(n) => return Ok(n),
+                Ok(n) => break n,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     embassy_futures::yield_now().await;
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(StdError::Io(e)),
             }
-        }
+        };
+        debug_bytes("MQTT <<", &buf[..n]);
+        Ok(n)
     }
 }
 

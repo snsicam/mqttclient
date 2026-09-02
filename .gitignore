@@ -11,6 +11,7 @@ target/
 # ===== 外部仓库符号链接（不纳入本仓）=====
 /guppyscreen
 /rust-libp2p
+/m2-software
 
 # ===== 日志 =====
 log.txt

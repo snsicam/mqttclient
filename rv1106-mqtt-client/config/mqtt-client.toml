@@ -16,6 +16,8 @@ wf = "PRINTER_WIFI"
 lang = 0
 
 [mqtt]
+# 设备型号：构成 topic GT/{model}/UP|DOWN|LWT/{deviceId}（默认 M1S）
+model = "M1S"
 broker = "127.0.0.1"
 port = 1883
 # 心跳（秒），MXS 协议要求 60
