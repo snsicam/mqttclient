@@ -5,12 +5,15 @@
 //! - 特征 `0xFF01`（write / write-without-response）：APP → 设备，字节交给 `BleLink::try_recv`
 //! - 特征 `0xFF02`（notify）：设备 → APP，经 `PropertiesChanged(Value)` 发送
 //!
-//! 应用层注册 `LEAdvertisement1`：`ServiceUUIDs=[0xFFFF]`（16-bit，供 APP 扫描阶段识别
-//! BluFi 设备）+ `LocalName`（供 APP 按名发现）。`LocalName` **取自 BlueZ adapter 的蓝牙名**
-//!（等价于系统脚本 `bt_ble_up.sh` 里的 `hciconfig hci0 name`，经 `name $NAME` 写入 scan_rsp、
-//! 完整且不截断），而不是应用层自拼 `{model}-{device_id}`（过长会截断）。名字来源顺序参考系统
-//! 脚本：adapter Name → `/etc/bluetooth/main.conf` Name → 回退到配置拼名，最终限制 29 字节
-//!（scan_rsp 预算 31 − 2 AD 头），绝不用 `name on`（kernel 会把长名截断到 10 字节）。
+//! 应用层注册 `LEAdvertisement1`：广播包(adv_data) 仅含 `ServiceUUIDs=[0xFFFF]`
+//!（16-bit，供 APP 扫描阶段识别 BluFi 设备），**设备名只放进扫描响应包(scan_rsp_data)
+//! 的 Complete Local Name（AD type 0x09）**。两个包各自 31 字节上限，名字（≤29 字节）
+//! 完整出现在 scan_rsp，既不会被挤进广播包而截断，也不会同时出现在两个包里。
+//! 设备名**取自 BlueZ adapter 的蓝牙名**（等价于系统脚本 `bt_ble_up.sh` 里的
+//! `hciconfig hci0 name`，经 `name $NAME` 写入 scan_rsp），而不是应用层自拼
+//! `{model}-{device_id}`（过长会截断）。名字来源顺序参考系统脚本：adapter Name →
+//! `/etc/bluetooth/main.conf` Name → 回退到配置拼名，最终限制 29 字节（scan_rsp 预算
+//! 31 − 2 AD 头），绝不用 `name on`（kernel 会把长名截断到 10 字节）。
 //!
 //! 线程模型：`start_gatt` 启动独立 `blufi-gatt` 线程跑 D-Bus 事件循环与 notify 派发；
 //! 返回的 [`GattBleLink`] 在 `blufi` worker 线程调用，通过两个 mpsc channel 与 gatt 线程桥接。
@@ -207,9 +210,12 @@ impl Char2 {
     }
 }
 
-// ---------- LE Advertisement（LocalName 取 adapter 名 + BluFi 服务 UUID） ----------
-// LocalName 取自 BlueZ adapter 蓝牙名（hciconfig hci0 name，系统脚本已写好进 scan_rsp），
-// 不再自拼长串；ServiceUUIDs=[0xFFFF]（16-bit）供 APP 扫描识别 BluFi。
+// ---------- LE Advertisement（adv 包只放 ServiceUUIDs，名字放 scan response） ----------
+// 广播包(adv_data) 仅含 ServiceUUIDs=[0xFFFF]（16-bit，3 字节），供 APP 扫描阶段识别 BluFi；
+// 设备名只放进扫描响应包(scan_rsp_data) 的 Complete Local Name（AD type 0x09）。
+// 两个包各自 31 字节上限，分开后名字（≤29 字节）完整出现在 scan_rsp，既不会被挤进
+// adv 包而截断，也不会同时出现在两个包里。名字取自 BlueZ adapter 蓝牙名（系统脚本
+// `hciconfig hci0 name` 已写好），不再自拼长串。
 struct Advertisement {
     adv_name: String,
 }
@@ -219,10 +225,6 @@ impl Advertisement {
     fn type_(&self) -> String {
         "peripheral".into()
     }
-    #[zbus(property, name = "LocalName")]
-    fn local_name(&self) -> String {
-        self.adv_name.clone()
-    }
     #[zbus(property, name = "ServiceUUIDs")]
     fn service_uuids(&self) -> Vec<String> {
         vec!["0xFFFF".to_string()]
@@ -230,6 +232,13 @@ impl Advertisement {
     #[zbus(property, name = "Discoverable")]
     fn discoverable(&self) -> bool {
         true
+    }
+    // 名字只放 scan response（AD type 0x09 = Complete Local Name），不在 adv 包里。
+    #[zbus(property, name = "ScanResponseData")]
+    fn scan_response_data(&self) -> HashMap<u8, OwnedValue> {
+        let mut m: HashMap<u8, OwnedValue> = HashMap::new();
+        m.insert(0x09u8, ov(self.adv_name.as_bytes().to_vec()));
+        m
     }
 }
 
@@ -287,9 +296,10 @@ fn run_gatt(
     let conn = Connection::system()?;
     log::info!("bluetooth: gatt connected to system bus");
 
-    // 广播名取自 adapter 蓝牙名（系统脚本已写好进 scan_rsp），而非自拼长串，避免截断
+    // 设备名取自 adapter 蓝牙名（系统脚本已写好进 scan_rsp），而非自拼长串，避免截断；
+    // 名字只放 scan response（见 Advertisement::scan_response_data），adv 包仅含 ServiceUUIDs
     let local_name = read_adapter_name(&conn, adapter, fallback);
-    log::info!("bluetooth: adv LocalName = {local_name} (from adapter/main.conf)");
+    log::info!("bluetooth: adv name(scan_rsp) = {local_name} (from adapter/main.conf)");
 
     // 缓存最近一帧，供 APP 订阅 notify 时补发（VERSION 帧常早于订阅发出）
     let last = Arc::new(Mutex::new(None::<Vec<u8>>));
@@ -328,7 +338,8 @@ fn run_gatt(
         }
     }
 
-    // LE 广播注册（仅声明 ServiceUUIDs=[0xFFFF]，LocalName 由系统侧负责，不在此覆盖）
+    // LE 广播注册：adv 包仅含 ServiceUUIDs=[0xFFFF]；设备名由 Advertisement 的
+    // ScanResponseData(AD 0x09) 放进 scan response，不挤占 adv 包 31B 预算
     backoff_ms = 1_000;
     loop {
         match register_advertisement(&conn, &adapter_path) {
