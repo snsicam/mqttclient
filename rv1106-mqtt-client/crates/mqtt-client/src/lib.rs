@@ -12,6 +12,7 @@
 //! - `gcode_translator`：M 码转换表
 
 pub mod app_state;
+pub mod blufi;
 pub mod config;
 pub mod downlink;
 pub mod gcode_translator;

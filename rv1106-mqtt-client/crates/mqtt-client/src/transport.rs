@@ -95,7 +95,8 @@ impl MqttTransport for StdTcpTransport {
                 Ok(0) => return Err(StdError::ConnectionClosed),
                 Ok(n) => written += n,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    embassy_futures::yield_now().await;
+                    // 非阻塞 socket 暂无可写数据：真正让出 CPU（1ms），避免 yield_now 忙等空转。
+                    std::thread::sleep(Duration::from_millis(1));
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(StdError::Io(e)),
@@ -111,7 +112,8 @@ impl MqttTransport for StdTcpTransport {
                 Ok(0) => return Err(StdError::ConnectionClosed),
                 Ok(n) => break n,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    embassy_futures::yield_now().await;
+                    // 非阻塞 socket 暂无可读数据：真正让出 CPU（1ms），避免 yield_now 忙等空转。
+                    std::thread::sleep(Duration::from_millis(1));
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(StdError::Io(e)),

@@ -31,10 +31,13 @@ done
 
 # ---- 目标与工具链 ----
 # RV1106 (Luckfox Pico) 官方 uclibc 1.0.31 工具链。Rust 无 uclibceabihf 标准 target，
-# 采用 armv7-unknown-linux-gnueabihf + uclibc gcc 作 linker/sysroot (见 .cargo/config.toml)。
+# 采用 armv7-unknown-linux-gnueabihf + uclibc gcc 作 linker/sysroot。
+# 必须用 uclibc 工具链：板子 rootfs 为 uclibc，gnu(glibc) 产物依赖 libc.so.6 /
+# ld-linux-armhf.so.3 无法运行。uclibc 缺失的 getauxval 与 posix_spawn* 辅助函数
+# 由 cross/ 下桩库补齐（libgetauxval.a / libposix_spawn.a，见 .cargo/config.toml）。
 TARGET="armv7-unknown-linux-gnueabihf"
 GCC_NAME="arm-rockchip830-linux-uclibcgnueabihf-gcc"
-TOOLCHAIN_DIR="${RV1106_TOOLCHAIN:-$PROJECT_ROOT/../luckfox-pico/tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf}"
+TOOLCHAIN_DIR="${RV1106_TOOLCHAIN:-/opt/toolchain/arm-rockchip830-linux-uclibcgnueabihf}"
 
 BIN_NAME="mqtt-client"
 OUT_DIR="$PROJECT_ROOT/target/$TARGET"
@@ -72,6 +75,9 @@ echo "      mode:    $( [ "$RELEASE" = true ] && echo release || echo debug )"
 # 避免污染 host 构建 (ring/cc-rs 在 host 编译时会误用交叉 gcc)。
 TARGET_UNDERSCORE=$(echo "$TARGET" | tr '-' '_')
 export CARGO_TARGET_${TARGET_UNDERSCORE^^}_LINKER="$GCC_NAME"
+# ring / cc-rs 等 build script 需要交叉 CC（与 rust-libp2p 的 build_device_cam.sh 一致）
+export CC_${TARGET_UNDERSCORE}="$GCC_NAME"
+export CFLAGS_${TARGET_UNDERSCORE}="-fPIC"
 
 # ---- 编译 ----
 echo ""

@@ -24,5 +24,6 @@ log.workspace = true
 env_logger.workspace = true
 ureq = "3"
 futures = "0.3"
+zbus = { workspace = true }
 
 [dev-dependencies]

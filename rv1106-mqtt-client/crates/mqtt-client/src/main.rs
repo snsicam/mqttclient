@@ -72,6 +72,36 @@ fn main() {
     }
     log::info!("RV1106 MQTT client start: device={} broker={}:{}", cfg.device.id, cfg.mqtt.broker, cfg.mqtt.port);
 
+    // 蓝牙初始化信息（AIC8800 → BlueZ hci0，应用走 D-Bus/GATT）
+    mqtt_client::blufi::init::init_bluetooth(&cfg.blufi);
+
+    // 蓝牙配网 worker（阶段 4：真实 GATT 链路）
+    if cfg.blufi.enabled {
+        use mqtt_client::blufi::{BluFiWorker, BlufiCmd, BlufiEvent};
+        let (blufi_cmd_tx, blufi_cmd_rx) = mpsc::channel::<BlufiCmd>();
+        let (blufi_ev_tx, blufi_ev_rx) = mpsc::channel::<BlufiEvent>();
+        let link = mqtt_client::blufi::gatt::start_gatt(&cfg.blufi, &cfg.device.id);
+        let _blufi = BluFiWorker::spawn_with_link(
+            cfg.blufi.clone(),
+            cfg.device.id.clone(),
+            blufi_cmd_rx,
+            blufi_ev_tx,
+            link,
+        );
+        std::thread::spawn(move || {
+            for ev in blufi_ev_rx {
+                match ev {
+                    BlufiEvent::EnterConfigMode => log::info!("blufi: enter config mode"),
+                    BlufiEvent::AppConnected => log::info!("blufi: app connected"),
+                    BlufiEvent::WifiConnected { ssid } => log::info!("blufi: wifi connected {ssid}"),
+                    BlufiEvent::WifiFailed { reason } => log::warn!("blufi: wifi failed: {reason}"),
+                    BlufiEvent::ExitConfigMode => log::info!("blufi: exit config mode"),
+                }
+            }
+        });
+        let _ = blufi_cmd_tx; // 预留：后续用于下发 StopConfig
+    }
+
     // 共享状态与通道
     let app_state = Arc::new(Mutex::new(AppState::default()));
     let (event_tx, event_rx) = mpsc::channel::<Event>();

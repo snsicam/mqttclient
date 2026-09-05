@@ -4,6 +4,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::Path;
 
+use crate::blufi::BluFiConfig;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -13,6 +14,9 @@ pub struct AppConfig {
     pub moonraker: MoonrakerConfig,
     #[serde(default)]
     pub download: DownloadConfig,
+    /// 蓝牙配网（BluFi）配置；段缺失时回退默认（详见 `BluFiConfig::default`）。
+    #[serde(default)]
+    pub blufi: BluFiConfig,
 }
 
 impl Default for AppConfig {
@@ -22,6 +26,7 @@ impl Default for AppConfig {
             mqtt: MqttConfig::default(),
             moonraker: MoonrakerConfig::default(),
             download: DownloadConfig::default(),
+            blufi: BluFiConfig::default(),
         }
     }
 }
@@ -356,6 +361,7 @@ port = 7125
             mqtt: MqttConfig::default(),
             moonraker: MoonrakerConfig::default(),
             download: DownloadConfig::default(),
+            blufi: BluFiConfig::default(),
         };
         assert!(cfg.validate().is_err());
     }

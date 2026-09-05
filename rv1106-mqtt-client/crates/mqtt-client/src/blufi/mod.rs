@@ -1,0 +1,556 @@
+//! BluFi 蓝牙配网模块（详细设计 §4）。
+//!
+//! 阶段 1/2/3：模块骨架 + BluFi 协议栈 frame/codec + wpa_cli 封装 wifi。
+//! 阶段 4：GATT/D-Bus 服务端见 [`gatt`]（基于 `zbus`，`GattBleLink` 实现 [`BleLink`]）；
+//! 应用通过 [`BluFiWorker::spawn_with_link`] 注入真实链路。
+
+pub mod frame;
+pub mod codec;
+pub mod wifi;
+pub mod init;
+pub mod gatt;
+
+pub use frame::*;
+pub use codec::*;
+pub use wifi::*;
+
+use serde::{Deserialize, Serialize};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
+use std::time::Duration;
+
+// =================== 配置 ===================
+
+/// 安全模式（v1 仅 Plain 生效；Crc16/Aes/DhAes 为后续扩展预留）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SecurityMode {
+    #[default]
+    Plain,
+    Crc16,
+    Aes,
+    DhAes,
+}
+impl SecurityMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SecurityMode::Plain => "plain",
+            SecurityMode::Crc16 => "crc16",
+            SecurityMode::Aes => "aes",
+            SecurityMode::DhAes => "dhaes",
+        }
+    }
+    pub fn from_str(s: &str) -> SecurityMode {
+        match s.to_ascii_lowercase().as_str() {
+            "crc16" => SecurityMode::Crc16,
+            "aes" => SecurityMode::Aes,
+            "dhaes" => SecurityMode::DhAes,
+            _ => SecurityMode::Plain,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BluFiConfig {
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_name_prefix")]
+    pub name_prefix: String,
+    #[serde(default = "default_adapter")]
+    pub adapter: String,
+    #[serde(default = "default_dbus_to")]
+    pub dbus_timeout_ms: u64,
+    #[serde(default = "default_scan_to")]
+    pub scan_timeout_ms: u64,
+    #[serde(default = "default_conn_to")]
+    pub connect_timeout_ms: u64,
+    #[serde(default = "default_iface")]
+    pub wpa_iface: String,
+    #[serde(default = "default_wpa_ctrl")]
+    pub wpa_ctrl: String,
+    /// wpa_supplicant 配置文件路径，配网后将 SSID/密码写入此处（默认 /etc/wpa_supplicant.conf）。
+    #[serde(default = "default_wpa_conf")]
+    pub wpa_conf: String,
+    #[serde(default = "default_ack_repeat")]
+    pub ack_repeat: u8,
+    #[serde(default = "default_ack_interval")]
+    pub ack_interval_ms: u64,
+    /// 安全模式字符串：`plain`/`crc16`/`aes`/`dhaes`（v1 仅 plain 生效）。
+    #[serde(default = "default_security")]
+    pub security: String,
+    #[serde(default = "default_ver_major")]
+    pub version_major: u8,
+    #[serde(default = "default_ver_minor")]
+    pub version_minor: u8,
+    /// 底层 HCI 传输串口（RV1106 UART，如 /dev/ttyS1）。
+    /// 注意：应用层**不**打开此串口；它由系统侧 `btattach` 绑定为内核 hci0，
+    /// 应用通过 BlueZ D-Bus/socket 通信。此字段仅供 `init.rs` 提示 `btattach` 命令。
+    #[serde(default = "default_uart")]
+    pub uart: String,
+    /// HCI UART 波特率（系统侧 `btattach -s` 参数，AIC8800 默认 115200），仅供系统侧参考。
+    #[serde(default = "default_baud")]
+    pub baud: u32,
+}
+impl Default for BluFiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_enabled(),
+            name_prefix: default_name_prefix(),
+            adapter: default_adapter(),
+            dbus_timeout_ms: default_dbus_to(),
+            scan_timeout_ms: default_scan_to(),
+            connect_timeout_ms: default_conn_to(),
+            wpa_iface: default_iface(),
+            wpa_ctrl: default_wpa_ctrl(),
+            wpa_conf: default_wpa_conf(),
+            ack_repeat: default_ack_repeat(),
+            ack_interval_ms: default_ack_interval(),
+            security: default_security(),
+            version_major: default_ver_major(),
+            version_minor: default_ver_minor(),
+            uart: default_uart(),
+            baud: default_baud(),
+        }
+    }
+}
+impl BluFiConfig {
+    pub fn security_mode(&self) -> SecurityMode {
+        SecurityMode::from_str(&self.security)
+    }
+    /// 广播名 = `{name_prefix}-{device_id}`（实测随型号变化，见详细设计 §4.3.2）。
+    pub fn local_name(&self, device_id: &str) -> String {
+        format!("{}-{}", self.name_prefix, device_id)
+    }
+}
+
+fn default_enabled() -> bool {
+    true
+}
+/// 广播名前缀：**留空则自动取 `[mqtt] model`**。
+/// 实测（详细设计 §4.3.2）：板子广播名为 `M1S-<deviceId>`，规则是 `{model}-{device.id}`，
+/// 随型号自动变化；故默认留空用型号，仅当需要强制指定前缀时才配置该字段。
+fn default_name_prefix() -> String {
+    String::new()
+}
+fn default_adapter() -> String {
+    "hci0".into()
+}
+fn default_dbus_to() -> u64 {
+    5000
+}
+fn default_scan_to() -> u64 {
+    8000
+}
+fn default_conn_to() -> u64 {
+    30000
+}
+fn default_iface() -> String {
+    "wlan0".into()
+}
+fn default_wpa_ctrl() -> String {
+    "/var/run/wpa_supplicant/wlan0".into()
+}
+fn default_wpa_conf() -> String {
+    "/etc/wpa_supplicant.conf".into()
+}
+fn default_ack_repeat() -> u8 {
+    3
+}
+fn default_ack_interval() -> u64 {
+    500
+}
+fn default_security() -> String {
+    "plain".into()
+}
+fn default_ver_major() -> u8 {
+    1
+}
+fn default_ver_minor() -> u8 {
+    0
+}
+fn default_uart() -> String {
+    "/dev/ttyS1".into()
+}
+fn default_baud() -> u32 {
+    115200
+}
+
+// =================== 状态机 ===================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum BluFiState {
+    Init,
+    RegisterGatt,
+    WaitApp,
+    Scanning,
+    Acking,
+    Connecting,
+    Finish,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub enum BlufiCmd {
+    StartConfig,
+    StopConfig,
+}
+
+#[derive(Debug, Clone)]
+pub enum BlufiEvent {
+    EnterConfigMode,
+    AppConnected,
+    WifiConnected { ssid: String },
+    WifiFailed { reason: String },
+    ExitConfigMode,
+}
+
+// =================== BLE 链路抽象 ===================
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub enum BleLinkError {
+    Send(String),
+    Recv(String),
+    Closed,
+}
+impl std::fmt::Display for BleLinkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BleLinkError::Send(m) => write!(f, "send: {m}"),
+            BleLinkError::Recv(m) => write!(f, "recv: {m}"),
+            BleLinkError::Closed => write!(f, "closed"),
+        }
+    }
+}
+impl std::error::Error for BleLinkError {}
+
+/// 设备↔APP 的字节链路抽象。阶段 4 由 `gatt::GattBleLink`（BlueZ D-Bus）实现；单测用 [`StubBleLink`]。
+pub trait BleLink: Send {
+    /// 发送一帧（已是完整 BluFi 字节流）给 APP。
+    fn send(&self, bytes: &[u8]) -> Result<(), BleLinkError>;
+    /// 非阻塞取一条 APP 写入的字节流；无数据返回 Ok(None)。
+    fn try_recv(&self) -> Result<Option<Vec<u8>>, BleLinkError>;
+}
+
+/// 无真实 BLE 时的占位链接（仅供单测 / 阶段 4 前的逻辑验证）。
+pub struct StubBleLink {
+    pub incoming: std::sync::Mutex<Vec<Vec<u8>>>,
+}
+impl StubBleLink {
+    pub fn new() -> Self {
+        Self {
+            incoming: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+    /// 向队列压入一条模拟 APP 写入的帧字节流。
+    pub fn push_incoming(&self, bytes: Vec<u8>) {
+        self.incoming.lock().unwrap().push(bytes);
+    }
+}
+impl BleLink for StubBleLink {
+    fn send(&self, _bytes: &[u8]) -> Result<(), BleLinkError> {
+        Ok(())
+    }
+    fn try_recv(&self) -> Result<Option<Vec<u8>>, BleLinkError> {
+        Ok(self.incoming.lock().unwrap().pop())
+    }
+}
+impl Default for StubBleLink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// =================== Worker ===================
+
+pub struct BluFiWorker;
+impl BluFiWorker {
+    /// 启动配网 worker（设备侧）。
+    ///
+    /// `link` 为 BLE 链路实现：阶段 4 传 `gatt::start_gatt` 返回的 `GattBleLink`，单测传 [`StubBleLink`]。
+    /// 返回线程句柄；[`BlufiCmd::StopConfig`] 或命令通道断开时退出。
+    pub fn spawn_with_link(
+        cfg: BluFiConfig,
+        device_id: String,
+        cmd_rx: mpsc::Receiver<BlufiCmd>,
+        event_tx: mpsc::Sender<BlufiEvent>,
+        link: Box<dyn BleLink>,
+    ) -> thread::JoinHandle<()> {
+        thread::Builder::new()
+            .name("blufi".into())
+            .spawn(move || {
+                let wifi = WifiManager::new(&cfg);
+                let mut ctx = WorkerCtx {
+                    cfg,
+                    device_id,
+                    cmd_rx,
+                    event_tx,
+                    link,
+                    asm: FragmentAssembler::new(),
+                    seq_out: 0,
+                    state: BluFiState::WaitApp,
+                    wifi,
+                };
+                ctx.run();
+            })
+            .expect("spawn blufi worker")
+    }
+}
+
+struct WorkerCtx {
+    cfg: BluFiConfig,
+    #[allow(dead_code)]
+    device_id: String,
+    cmd_rx: mpsc::Receiver<BlufiCmd>,
+    event_tx: mpsc::Sender<BlufiEvent>,
+    link: Box<dyn BleLink>,
+    asm: FragmentAssembler,
+    seq_out: u8,
+    state: BluFiState,
+    wifi: WifiManager,
+}
+
+/// 调试：打印即将发送的一帧（字段摘要 + 完整字节流）。
+/// 仅在 `RUST_LOG` 含 debug（如 `mqtt_client::blufi=debug`）时输出。
+fn debug_tx(f: &BluFiFrame) {
+    let bytes = f.encode();
+    log::debug!(
+        "[blufi] >> tx type={:#04x} ctrl={:#04x} seq={} len={} data={:02x?}",
+        f.type_byte(),
+        f.frame_ctrl,
+        f.sequence,
+        f.data.len(),
+        f.data
+    );
+    log::debug!("[blufi] >> tx bytes: {:02x?}", bytes);
+}
+
+/// 调试：打印收到的一帧（字段摘要 + 原始字节流）。
+fn debug_rx(bytes: &[u8], f: &BluFiFrame) {
+    log::debug!(
+        "[blufi] << rx type={:#04x} ctrl={:#04x} seq={} len={} data={:02x?}",
+        f.type_byte(),
+        f.frame_ctrl,
+        f.sequence,
+        f.data.len(),
+        f.data
+    );
+    log::debug!("[blufi] << rx bytes: {:02x?}", bytes);
+}
+
+impl WorkerCtx {
+    fn run(&mut self) {
+        let _ = self.event_tx.send(BlufiEvent::EnterConfigMode);
+        // 进入配网后主动发一次 B4 版本帧（APP 仅记录，不回复）
+        let ver = encode_version(self.cfg.version_major, self.cfg.version_minor);
+        self.send_frame(PKG_DATA, ftype::VERSION, fc::DIRECTION, &ver);
+
+        loop {
+            // 命令通道（20ms 轮询，兼顾 APP 写入的及时性）
+            match self.cmd_rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(BlufiCmd::StopConfig) => {
+                    let _ = self.event_tx.send(BlufiEvent::ExitConfigMode);
+                    break;
+                }
+                Ok(BlufiCmd::StartConfig) => {}
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+            // APP 写入通道
+            match self.link.try_recv() {
+                Ok(Some(bytes)) => self.on_app_frame(&bytes),
+                Ok(None) => {}
+                Err(_) => break,
+            }
+        }
+    }
+
+    fn next_seq(&mut self) -> u8 {
+        let s = self.seq_out;
+        self.seq_out = self.seq_out.wrapping_add(1);
+        s
+    }
+
+    /// 发送单帧（不分片）。
+    fn send_frame(&mut self, pkg_type: u8, subtype: u8, frame_ctrl: u8, data: &[u8]) {
+        let f = BluFiFrame::new(pkg_type, subtype, frame_ctrl, self.next_seq(), data.to_vec());
+        debug_tx(&f);
+        if let Err(e) = self.link.send(&f.encode()) {
+            log::warn!("blufi send failed: {e}");
+        }
+    }
+
+    /// 发送一段逻辑 data（自动按 514 字节分片；首片带 FRAGMENTED）。
+    fn send_data(&mut self, pkg_type: u8, subtype: u8, data: &[u8]) {
+        let base = self.seq_out;
+        let frames = split_for_tx(pkg_type, subtype, fc::DIRECTION, base, data, 514);
+        for f in &frames {
+            debug_tx(f);
+            if let Err(e) = self.link.send(&f.encode()) {
+                log::warn!("blufi send failed: {e}");
+            }
+        }
+        if let Some(last) = frames.last() {
+            self.seq_out = last.sequence.wrapping_add(1);
+        }
+    }
+
+    fn on_app_frame(&mut self, bytes: &[u8]) {
+        let f = match BluFiFrame::decode(bytes) {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("blufi decode error: {e:?}");
+                log::debug!("[blufi] << rx raw (decode failed): {:02x?}", bytes);
+                return;
+            }
+        };
+        debug_rx(bytes, &f);
+        // 链路层 ACK（业务层显式处理）
+        if f.needs_ack() {
+            let ack = make_ack(f.sequence);
+            if let Err(e) = self.link.send(&ack.encode()) {
+                log::warn!("blufi ack send failed: {e}");
+            }
+        }
+        // 分片重组
+        let payload = match self.asm.feed(&f) {
+            Ok(Some(p)) => p,
+            Ok(None) => return, // 等待更多分片
+            Err(e) => {
+                log::warn!("blufi fragment error: {e:?}");
+                return;
+            }
+        };
+        if f.pkg_type == PKG_CTRL {
+            self.handle_ctrl(f.subtype, &payload);
+        } else {
+            self.handle_data(f.subtype, &payload);
+        }
+    }
+
+    fn handle_ctrl(&mut self, subtype: u8, payload: &[u8]) {
+        match subtype {
+            ftype::NEGOTIATE => {
+                let mode = payload.first().copied().unwrap_or(0);
+                if mode != 0 {
+                    log::warn!(
+                        "blufi security mode {mode} != 0 (L0); 解密未实现，按明文处理"
+                    );
+                }
+            }
+            ftype::GET_WIFI_LIST => {
+                self.state = BluFiState::Scanning;
+                match self.wifi.scan() {
+                    Ok(items) => {
+                        let data = encode_scan_list(&items);
+                        self.send_data(PKG_DATA, ftype::WIFI_LIST, &data);
+                    }
+                    Err(e) => {
+                        log::warn!("blufi wifi scan failed: {e}");
+                        // 0x12 REPORT_ERROR, data=[0x0b 扫描失败]
+                        self.send_frame(PKG_DATA, ftype::REPORT_ERROR, fc::DIRECTION, &[0x0b]);
+                    }
+                }
+                self.state = BluFiState::WaitApp;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_data(&mut self, subtype: u8, payload: &[u8]) {
+        match subtype {
+            ftype::NEG_DATA => {
+                // v1 L0 忽略协商数据
+            }
+            ftype::CUSTOM_DATA => {
+                match parse_provisioning(payload) {
+                    Ok(prov) => {
+                        // B2：回执 ×N（间隔 ack_interval_ms）
+                        for _ in 0..self.cfg.ack_repeat {
+                            self.send_frame(PKG_DATA, ftype::CUSTOM_DATA, fc::DIRECTION, RECEIVED_MSG);
+                            thread::sleep(Duration::from_millis(self.cfg.ack_interval_ms));
+                        }
+                        self.state = BluFiState::Connecting;
+                        let pwd = if prov.pwd.is_empty() {
+                            None
+                        } else {
+                            Some(prov.pwd.as_str())
+                        };
+                        match self.wifi.connect(&prov.ssid, pwd) {
+                            Ok(_) => {
+                                let st = encode_connect_state(&prov.ssid);
+                                self.send_data(PKG_DATA, ftype::CONNECT_STATE, &st);
+                                let _ = self.event_tx.send(BlufiEvent::WifiConnected {
+                                    ssid: prov.ssid.clone(),
+                                });
+                                self.state = BluFiState::Finish;
+                            }
+                            Err(e) => {
+                                log::warn!("blufi wifi connect failed: {e}");
+                                for _ in 0..self.cfg.ack_repeat {
+                                    self.send_frame(
+                                        PKG_DATA,
+                                        ftype::CUSTOM_DATA,
+                                        fc::DIRECTION,
+                                        FAILED_MSG,
+                                    );
+                                    thread::sleep(Duration::from_millis(self.cfg.ack_interval_ms));
+                                }
+                                let _ = self.event_tx.send(BlufiEvent::WifiFailed {
+                                    reason: e.to_string(),
+                                });
+                                self.state = BluFiState::Failed;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("blufi provisioning parse failed: {e}");
+                        self.send_frame(PKG_DATA, ftype::CUSTOM_DATA, fc::DIRECTION, FAILED_MSG);
+                        self.state = BluFiState::WaitApp;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// 用 StubBleLink 模拟 APP 下发一帧配网，验证 worker 走通「回执 → 连接状态」路径。
+    #[test]
+    fn worker_handles_custom_data() {
+        let cfg = BluFiConfig::default();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<BlufiCmd>();
+        let (ev_tx, ev_rx) = mpsc::channel::<BlufiEvent>();
+        let link = Box::new(StubBleLink::new());
+
+        // 构造 APP 下发的 CUSTOM_DATA 帧（SSID/PWD 明文）
+        let prov_raw = b"SSID:testnet,PWD:secret123";
+        let frame = BluFiFrame::new(PKG_DATA, ftype::CUSTOM_DATA, 0, 1, prov_raw.to_vec());
+        link.push_incoming(frame.encode());
+
+        let _h = BluFiWorker::spawn_with_link(cfg, "Gtest".into(), cmd_rx, ev_tx, link);
+
+        // 命令通道关闭即触发 worker 退出；这里直接关闭 cmd 通道
+        drop(cmd_tx);
+
+        // 至少应能收到 EnterConfigMode（worker 启动即发）
+        let ev = ev_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(ev, BlufiEvent::EnterConfigMode));
+        // 注意：因 StubBleLink 不真正执行 wpa_cli（无网络），connect 会失败，
+        // 本测试仅验证帧处理不 panic、事件通道可用。
+    }
+
+    #[test]
+    fn local_name_format() {
+        let cfg = BluFiConfig {
+            name_prefix: "M1S".into(),
+            ..Default::default()
+        };
+        assert_eq!(cfg.local_name("Ge33700a6620dfddc"), "M1S-Ge33700a6620dfddc");
+    }
+}

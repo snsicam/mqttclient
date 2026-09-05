@@ -371,6 +371,7 @@ mod tests {
             mqtt: crate::config::MqttConfig::default(),
             moonraker: crate::config::MoonrakerConfig::default(),
             download: crate::config::DownloadConfig::default(),
+            blufi: crate::blufi::BluFiConfig::default(),
         };
         let (event_tx, event_rx) = mpsc::channel::<Event>();
         let (cmd_tx, _cmd_rx) = mpsc::channel::<DownlinkCmd>();
