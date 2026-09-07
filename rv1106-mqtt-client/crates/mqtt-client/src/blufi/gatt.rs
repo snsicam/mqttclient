@@ -9,10 +9,17 @@
 //! - 特征 `0xFF01`（write / write-without-response）：APP → 设备，字节交给 `BleLink::try_recv`
 //! - 特征 `0xFF02`（notify）：设备 → APP，经 bluer 的 `CharacteristicNotifier` 发送
 //!
-//! 设备名取自 BlueZ adapter 的 `Name`（等价于系统脚本 `hciconfig hci0 name`），
-//! 而不是应用层自拼 `{model}-{device_id}`（过长会在广播包里被截断）；读不到时依次
-//! 回退 `/etc/bluetooth/main.conf` 的 `Name=` → 配置拼名，最终限制 29 字节
-//! （AD 结构 31 − 2 头字节）。
+//! 广播名使用蓝牙「友好名」`Adapter::alias()`（即 main.conf `Name` 的完整值，例如
+//! `M1S-Ge33700a6620dfddc`），与系统脚本 `bt_ble_up.sh` 一致。
+//!
+//! **不要**读 `Adapter::system_name()`（= BlueZ `Adapter1.Name` = 系统主机名）：本板
+//! 主机名被截成 10 字节（`M1S-Ge3370`），正是 app 看到「被截断」的根因；也不要用
+//! `name on` 式的内核短名（内核 `HCI_MAX_SHORT_NAME_LENGTH = 10`）。bluer 的
+//! `local_name` 把名字交给 BlueZ 写进 scan response（Complete Local Name，31 字节
+//! 预算），不受 10 字节内核限制——故只要名字源正确，app 即显示全名。
+//!
+//! 仅在 adapter 友好名 / main.conf 都缺失时，才回退到配置短名
+//! `{name_prefix}-{device_id}`（`name_prefix` 为空时 `device_id`），与 `BluFiConfig::local_name` 一致。
 //!
 //! 线程模型：`start_gatt` 启动独立 `blufi-gatt` 线程，在其中建 tokio
 //! `current_thread` runtime 并 `block_on` 异步 GATT 服务端（bluer 是异步 API，
@@ -49,26 +56,92 @@ const CHAR2_UUID: Uuid = Uuid::from_u128(0x0000ff02_0000_1000_8000_00805f9b34fb)
 
 /// 下行（设备 → APP）广播通道容量。APP 未订阅时不积压（send 直接返回无接收者）。
 const OUTBOUND_CAP: usize = 64;
-/// 广播名字节上限（AD 结构 31 − 2 头字节），超出会被 BlueZ 截断。
-const NAME_MAX: usize = 29;
 /// 注册失败后的重试退避上限。
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// APP 使能 notify 后补发首帧前的延时：等 BlueZ 内部就绪，避免首帧丢失。
 const RESEND_DELAY: Duration = Duration::from_millis(100);
+
+/// 广播名硬上限（scan response 31 字节预算，2 字节 AD 头 → 名字 ≤ 29）。
+/// 仅作安全兜底；名字过长由 BlueZ 在 scan response 阶段处理（与 `bt_ble_up.sh` 一致）。
+const NAME_MAX: usize = 29;
+
+/// 按 UTF-8 字符边界截断（避免切到多字节字符中间），长度按字节计。
+fn truncate_bytes(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+/// 从 `/etc/bluetooth/main.conf` 读取 `[General] Name = ...`（蓝牙友好名的真实来源）。
+/// 失败 / 不存在 / 为空时返回 `None`。
+fn read_main_conf_name() -> Option<String> {
+    let content = std::fs::read_to_string("/etc/bluetooth/main.conf").ok()?;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // 形如 `Name = M1S-Ge33700a6620dfddc`（等号前允许空白，值可带引号）
+        if let Some(rest) = line.strip_prefix("Name").map(|s| s.trim_start()) {
+            if let Some(stripped) = rest.strip_prefix('=') {
+                let name = stripped.trim().trim_matches('"').to_string();
+                if !name.is_empty() {
+                    return Some(name);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 解析广播用的完整蓝牙名：
+/// 1) 优先 adapter 友好名 `Alias`（= main.conf `Name` 的完整值，等效系统脚本的
+///    `hciconfig hci0 name`）；
+/// 2) 其次直接解析 main.conf `Name`；
+/// 3) 最后用配置兜底短名（`{name_prefix}-{device_id}` / `device_id`）。
+///
+/// 关键：**不能**用 `Adapter::system_name()`（= BlueZ `Adapter1.Name` = 系统主机名），
+/// 本板主机名被截成 10 字节（`M1S-Ge3370`），正是 app「被截断」的元凶。仅当 `Alias`
+/// 与 `system_name()` 不同（即确为显式友好名）时才采用，避免回退到被截主机名。
+async fn resolve_local_name(adapter: &Adapter, cfg_fallback: &str) -> String {
+    if let Ok(alias) = adapter.alias().await {
+        if !alias.is_empty() {
+            match adapter.system_name().await {
+                // Alias 与 system_name 不同 → 是显式友好名（完整），采用
+                Ok(sys) if alias != sys => return truncate_bytes(&alias, NAME_MAX),
+                // 取不到 system_name 无法判断 → 直接信任 alias
+                Err(_) => return truncate_bytes(&alias, NAME_MAX),
+                // 二者相同 → Alias 回退到了被截主机名，改用 main.conf / 配置
+                Ok(_) => {}
+            }
+        }
+    }
+    if let Some(name) = read_main_conf_name() {
+        if !name.is_empty() {
+            return truncate_bytes(&name, NAME_MAX);
+        }
+    }
+    truncate_bytes(cfg_fallback, NAME_MAX)
+}
 
 /// 启动 GATT 服务端并返回桥接 [`BleLink`]。
 ///
 /// 返回的 link 交给 `BluFiWorker::spawn_with_link`；本函数另起 `blufi-gatt` 线程
 /// 运行 tokio runtime + bluer 服务端，注册失败会自动退避重试。
 pub fn start_gatt(cfg: &BluFiConfig, device_id: &str) -> Box<dyn BleLink> {
-    // 广播名回退值：配置 name_prefix 时用 `{prefix}-{device_id}`，否则 `device_id` 本身；
-    // 实际广播名优先取 adapter 的 Name（见 adapter_local_name），这里仅作兜底。
+    // 广播名兜底：仅在 adapter 友好名 / main.conf 都缺失时使用。
+    // 正常情况广播名来自 `Adapter::alias()`（= main.conf `Name`，完整 `M1S-Ge33700a6620dfddc`）。
+    // 配置短名 `{name_prefix}-{device_id}`（`name_prefix` 为空时为 `device_id`）。
     let fallback = if cfg.name_prefix.is_empty() {
         device_id.to_string()
     } else {
         cfg.local_name(device_id)
     };
-    let fallback = truncate_bytes(&fallback, NAME_MAX);
 
     // 上行：write 回调 → worker
     let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>();
@@ -204,9 +277,9 @@ async fn serve(
     // hci0 未上电时注册广播/服务会失败
     adapter.set_powered(true).await?;
 
-    let local_name = adapter_local_name(&adapter, fallback).await;
+    let local_name = resolve_local_name(&adapter, fallback).await;
     log::info!(
-        "bluetooth: advertising on adapter {} as {:?}",
+        "bluetooth: advertising on adapter {} as {:?} (friendly name / main.conf, not system hostname)",
         adapter.name(),
         local_name
     );
@@ -377,46 +450,4 @@ async fn notify_session(
         }
     }
     log::info!("bluetooth: notify session stop");
-}
-
-/// 读取广播用的设备名：adapter 的 `Name`（等价 `hciconfig hci0 name`）→
-/// `/etc/bluetooth/main.conf` 的 `Name=` → 配置拼名，最后截断到 29 字节。
-async fn adapter_local_name(adapter: &Adapter, fallback: &str) -> String {
-    let name = adapter
-        .system_name()
-        .await
-        .ok()
-        .filter(|n| !n.is_empty())
-        .or_else(read_main_conf_name)
-        .unwrap_or_else(|| fallback.to_string());
-    let name = truncate_bytes(&name, NAME_MAX);
-    log::info!("bluetooth: adv name = {name} (from adapter/main.conf)");
-    name
-}
-
-/// 从 `/etc/bluetooth/main.conf` 的 `Name=` 读设备名（系统脚本同样的兜底来源）。
-fn read_main_conf_name() -> Option<String> {
-    std::fs::read_to_string("/etc/bluetooth/main.conf")
-        .ok()
-        .and_then(|c| {
-            c.lines().find_map(|l| {
-                let l = l.trim();
-                l.strip_prefix("Name").map(|v| {
-                    v.trim_matches(|c: char| c == '=' || c == ' ' || c == '\t' || c == '"')
-                        .to_string()
-                })
-            })
-        })
-}
-
-/// 按 UTF-8 安全截断到 `max` 字节（不切断多字节字符）。
-fn truncate_bytes(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s[..end].to_string()
 }
