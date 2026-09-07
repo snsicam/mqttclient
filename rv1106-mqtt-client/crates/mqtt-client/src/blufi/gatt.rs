@@ -9,17 +9,13 @@
 //! - 特征 `0xFF01`（write / write-without-response）：APP → 设备，字节交给 `BleLink::try_recv`
 //! - 特征 `0xFF02`（notify）：设备 → APP，经 bluer 的 `CharacteristicNotifier` 发送
 //!
-//! 广播名使用蓝牙「友好名」`Adapter::alias()`（即 main.conf `Name` 的完整值，例如
-//! `M1S-Ge33700a6620dfddc`），与系统脚本 `bt_ble_up.sh` 一致。
-//!
-//! **不要**读 `Adapter::system_name()`（= BlueZ `Adapter1.Name` = 系统主机名）：本板
-//! 主机名被截成 10 字节（`M1S-Ge3370`），正是 app 看到「被截断」的根因；也不要用
-//! `name on` 式的内核短名（内核 `HCI_MAX_SHORT_NAME_LENGTH = 10`）。bluer 的
+//! 广播名由调用方按规则生成后传入：`{model}-{device.id}`（例如 `M1S-Ge33700a6620dfddc`），
+//! 其中 `model` 来自配置 `[mqtt] model`、`device.id` 来自板载序列号
+//!（`config.rs::device_id_from_serial()`，前缀 `G`）。本模块**不**读取
+//! `Adapter::alias()` / `main.conf` `Name` / `system_name()` —— 这些要么是被内核截成
+//! 10 字节的主机名（`M1S-Ge3370`），要么与「module + 设备 id」规则无关。bluer 的
 //! `local_name` 把名字交给 BlueZ 写进 scan response（Complete Local Name，31 字节
-//! 预算），不受 10 字节内核限制——故只要名字源正确，app 即显示全名。
-//!
-//! 仅在 adapter 友好名 / main.conf 都缺失时，才回退到配置短名
-//! `{name_prefix}-{device_id}`（`name_prefix` 为空时 `device_id`），与 `BluFiConfig::local_name` 一致。
+//! 预算），不受 10 字节内核限制——故只要调用方传入的名字源正确，app 即显示全名。
 //!
 //! 线程模型：`start_gatt` 启动独立 `blufi-gatt` 线程，在其中建 tokio
 //! `current_thread` runtime 并 `block_on` 异步 GATT 服务端（bluer 是异步 API，
@@ -41,7 +37,7 @@ use bluer::gatt::local::{
     Application, Characteristic, CharacteristicNotify, CharacteristicNotifyMethod, CharacteristicRead,
     CharacteristicWrite, CharacteristicWriteMethod, Service,
 };
-use bluer::{Adapter, Session, Uuid};
+use bluer::{Session, Uuid};
 use futures::FutureExt;
 use tokio::sync::broadcast;
 
@@ -77,71 +73,16 @@ fn truncate_bytes(s: &str, max: usize) -> String {
     s[..end].to_string()
 }
 
-/// 从 `/etc/bluetooth/main.conf` 读取 `[General] Name = ...`（蓝牙友好名的真实来源）。
-/// 失败 / 不存在 / 为空时返回 `None`。
-fn read_main_conf_name() -> Option<String> {
-    let content = std::fs::read_to_string("/etc/bluetooth/main.conf").ok()?;
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        // 形如 `Name = M1S-Ge33700a6620dfddc`（等号前允许空白，值可带引号）
-        if let Some(rest) = line.strip_prefix("Name").map(|s| s.trim_start()) {
-            if let Some(stripped) = rest.strip_prefix('=') {
-                let name = stripped.trim().trim_matches('"').to_string();
-                if !name.is_empty() {
-                    return Some(name);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// 解析广播用的完整蓝牙名：
-/// 1) 优先 adapter 友好名 `Alias`（= main.conf `Name` 的完整值，等效系统脚本的
-///    `hciconfig hci0 name`）；
-/// 2) 其次直接解析 main.conf `Name`；
-/// 3) 最后用配置兜底短名（`{name_prefix}-{device_id}` / `device_id`）。
-///
-/// 关键：**不能**用 `Adapter::system_name()`（= BlueZ `Adapter1.Name` = 系统主机名），
-/// 本板主机名被截成 10 字节（`M1S-Ge3370`），正是 app「被截断」的元凶。仅当 `Alias`
-/// 与 `system_name()` 不同（即确为显式友好名）时才采用，避免回退到被截主机名。
-async fn resolve_local_name(adapter: &Adapter, cfg_fallback: &str) -> String {
-    if let Ok(alias) = adapter.alias().await {
-        if !alias.is_empty() {
-            match adapter.system_name().await {
-                // Alias 与 system_name 不同 → 是显式友好名（完整），采用
-                Ok(sys) if alias != sys => return truncate_bytes(&alias, NAME_MAX),
-                // 取不到 system_name 无法判断 → 直接信任 alias
-                Err(_) => return truncate_bytes(&alias, NAME_MAX),
-                // 二者相同 → Alias 回退到了被截主机名，改用 main.conf / 配置
-                Ok(_) => {}
-            }
-        }
-    }
-    if let Some(name) = read_main_conf_name() {
-        if !name.is_empty() {
-            return truncate_bytes(&name, NAME_MAX);
-        }
-    }
-    truncate_bytes(cfg_fallback, NAME_MAX)
-}
-
 /// 启动 GATT 服务端并返回桥接 [`BleLink`]。
 ///
 /// 返回的 link 交给 `BluFiWorker::spawn_with_link`；本函数另起 `blufi-gatt` 线程
 /// 运行 tokio runtime + bluer 服务端，注册失败会自动退避重试。
-pub fn start_gatt(cfg: &BluFiConfig, device_id: &str) -> Box<dyn BleLink> {
-    // 广播名兜底：仅在 adapter 友好名 / main.conf 都缺失时使用。
-    // 正常情况广播名来自 `Adapter::alias()`（= main.conf `Name`，完整 `M1S-Ge33700a6620dfddc`）。
-    // 配置短名 `{name_prefix}-{device_id}`（`name_prefix` 为空时为 `device_id`）。
-    let fallback = if cfg.name_prefix.is_empty() {
-        device_id.to_string()
-    } else {
-        cfg.local_name(device_id)
-    };
+///
+/// `bluetooth_name` 为完整广播名，由调用方按 `{model}-{device.id}` 生成
+/// （见 `BluFiConfig::bluetooth_name`），本函数**不**读取 `Adapter::alias()` /
+/// `main.conf` `Name` / `system_name()`。仅做长度兜底（scan response 31 字节预算）。
+pub fn start_gatt(cfg: &BluFiConfig, bluetooth_name: &str) -> Box<dyn BleLink> {
+    let local_name = truncate_bytes(bluetooth_name, NAME_MAX);
 
     // 上行：write 回调 → worker
     let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>();
@@ -170,7 +111,7 @@ pub fn start_gatt(cfg: &BluFiConfig, device_id: &str) -> Box<dyn BleLink> {
                 }
             };
             rt.block_on(serve_loop(
-                &adapter, advertise, &fallback, g_inbound, g_outbound, g_last,
+                &adapter, advertise, &local_name, g_inbound, g_outbound, g_last,
             ));
         })
         .expect("spawn blufi-gatt");
@@ -227,14 +168,14 @@ impl BleLink for GattBleLink {
 async fn serve_loop(
     adapter: &str,
     advertise: bool,
-    fallback: &str,
+    local_name: &str,
     inbound_tx: Arc<Mutex<mpsc::Sender<Vec<u8>>>>,
     outbound_tx: Arc<Mutex<broadcast::Sender<Vec<u8>>>>,
     last: Arc<Mutex<Option<Vec<u8>>>>,
 ) {
     let mut backoff = Duration::from_secs(1);
     loop {
-        match serve(adapter, advertise, fallback, &inbound_tx, &outbound_tx, &last).await {
+        match serve(adapter, advertise, local_name, &inbound_tx, &outbound_tx, &last).await {
             Ok(()) => return,
             Err(e) => {
                 log::warn!(
@@ -257,7 +198,7 @@ async fn serve_loop(
 async fn serve(
     adapter_name: &str,
     advertise: bool,
-    fallback: &str,
+    advertised_name: &str,
     inbound_tx: &Arc<Mutex<mpsc::Sender<Vec<u8>>>>,
     outbound_tx: &Arc<Mutex<broadcast::Sender<Vec<u8>>>>,
     last: &Arc<Mutex<Option<Vec<u8>>>>,
@@ -277,9 +218,9 @@ async fn serve(
     // hci0 未上电时注册广播/服务会失败
     adapter.set_powered(true).await?;
 
-    let local_name = resolve_local_name(&adapter, fallback).await;
+    let local_name = advertised_name.to_string();
     log::info!(
-        "bluetooth: advertising on adapter {} as {:?} (friendly name / main.conf, not system hostname)",
+        "bluetooth: advertising on adapter {} as {:?} (name = {{model}}-{{device.id}}, not from main.conf/alias)",
         adapter.name(),
         local_name
     );

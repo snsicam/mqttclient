@@ -128,9 +128,13 @@ impl BluFiConfig {
     pub fn security_mode(&self) -> SecurityMode {
         SecurityMode::from_str(&self.security)
     }
-    /// 广播名 = `{name_prefix}-{device_id}`（实测随型号变化，见详细设计 §4.3.2）。
-    pub fn local_name(&self, device_id: &str) -> String {
-        format!("{}-{}", self.name_prefix, device_id)
+    /// 蓝牙广播名 = `{前缀}-{device_id}`。
+    /// `前缀` 取 `name_prefix`（若非空），否则取 `model`（即配置 `[mqtt] model`，随型号变化）。
+    /// 即完整广播名 = `{model|name_prefix}-{device.id}`，如 `M1S-Ge33700a6620dfddc`。
+    /// 注意：`name_prefix` 为空时**不可**直接用它拼（会得到 `-device_id`），必须回退到 `model`。
+    pub fn bluetooth_name(&self, model: &str, device_id: &str) -> String {
+        let prefix = if self.name_prefix.is_empty() { model } else { &self.name_prefix };
+        format!("{}-{}", prefix, device_id)
     }
 }
 
@@ -567,11 +571,15 @@ mod tests {
     }
 
     #[test]
-    fn local_name_format() {
-        let cfg = BluFiConfig {
-            name_prefix: "M1S".into(),
+    fn bluetooth_name_format() {
+        // name_prefix 留空 → 跟随 model
+        let cfg = BluFiConfig::default();
+        assert_eq!(cfg.bluetooth_name("M1S", "Ge33700a6620dfddc"), "M1S-Ge33700a6620dfddc");
+        // name_prefix 显式指定 → 用 name_prefix（覆盖 model）
+        let cfg2 = BluFiConfig {
+            name_prefix: "M2".into(),
             ..Default::default()
         };
-        assert_eq!(cfg.local_name("Ge33700a6620dfddc"), "M1S-Ge33700a6620dfddc");
+        assert_eq!(cfg2.bluetooth_name("M1S", "Ge33700a6620dfddc"), "M2-Ge33700a6620dfddc");
     }
 }

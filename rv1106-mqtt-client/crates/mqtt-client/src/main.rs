@@ -83,7 +83,8 @@ fn main() {
     let (blufi_cmd_tx, blufi_cmd_rx) = mpsc::channel::<BlufiCmd>();
     let (blufi_ev_tx, blufi_ev_rx) = mpsc::channel::<BlufiEvent>();
     if cfg.blufi.enabled {
-        let link = mqtt_client::blufi::gatt::start_gatt(&cfg.blufi, &cfg.device.id);
+        let bt_name = cfg.blufi.bluetooth_name(&cfg.mqtt.model, &cfg.device.id);
+        let link = mqtt_client::blufi::gatt::start_gatt(&cfg.blufi, &bt_name);
         let _blufi = BluFiWorker::spawn_with_link(
             cfg.blufi.clone(),
             cfg.device.id.clone(),
