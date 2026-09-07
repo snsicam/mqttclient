@@ -1,7 +1,7 @@
 //! BluFi 蓝牙配网模块（详细设计 §4）。
 //!
 //! 阶段 1/2/3：模块骨架 + BluFi 协议栈 frame/codec + wpa_cli 封装 wifi。
-//! 阶段 4：GATT/D-Bus 服务端见 [`gatt`]（基于 `zbus`，`GattBleLink` 实现 [`BleLink`]）；
+//! 阶段 4：GATT/D-Bus 服务端见 [`gatt`]（基于 `bluer`，`GattBleLink` 实现 [`BleLink`]）；
 //! 应用通过 [`BluFiWorker::spawn_with_link`] 注入真实链路。
 
 pub mod frame;
@@ -53,6 +53,17 @@ impl SecurityMode {
 pub struct BluFiConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// 是否由应用层注册 LE 广播。
+    ///
+    /// 广播与 GATT 注册是两件事：广播只负责「让手机扫到/能连上」，GATT 应用
+    /// 负责「连上后能看到哪些服务与特征」。
+    ///
+    /// **默认 `false`**：板子系统侧已在广播（手机 APP 能直接发现并连接），
+    /// 应用层只注册 GATT 应用即可，避免重复注册广播失败
+    /// （BlueZ/控制器对同时广播的实例数有限制）。
+    /// 仅当系统侧不广播、需要应用层自己广播时才设为 `true`。
+    #[serde(default = "default_advertise")]
+    pub advertise: bool,
     #[serde(default = "default_name_prefix")]
     pub name_prefix: String,
     #[serde(default = "default_adapter")]
@@ -94,6 +105,7 @@ impl Default for BluFiConfig {
     fn default() -> Self {
         Self {
             enabled: default_enabled(),
+            advertise: default_advertise(),
             name_prefix: default_name_prefix(),
             adapter: default_adapter(),
             dbus_timeout_ms: default_dbus_to(),
@@ -123,6 +135,14 @@ impl BluFiConfig {
 }
 
 fn default_enabled() -> bool {
+    true
+}
+/// 默认**广播**：RV1106 buildroot 板子系统侧广播器未必发布 BluFi 的 `0xFFFF` 服务
+/// （实测需应用层自己广播，手机才能发现并连接，否则报 discover service failed）。
+/// 故默认 `true` 由 mqtt-client 自注册 LE 广播（ServiceUUIDs=[0xFFFF]）。
+/// 若系统侧已在广播，本应用的 `RegisterAdvertisement` 会失败——`gatt.rs` 已对此
+/// 做了优雅降级（仅告警并继续注册 GATT 应用），不会阻断 BluFi 服务。
+fn default_advertise() -> bool {
     true
 }
 /// 广播名前缀：**留空则自动取 `[mqtt] model`**。
@@ -396,6 +416,7 @@ impl WorkerCtx {
     }
 
     fn on_app_frame(&mut self, bytes: &[u8]) {
+        log::info!("[blufi] << rx raw {} bytes: {:02x?}", bytes.len(), bytes);
         let f = match BluFiFrame::decode(bytes) {
             Ok(f) => f,
             Err(e) => {

@@ -24,6 +24,14 @@ log.workspace = true
 env_logger.workspace = true
 ureq = "3"
 futures = "0.3"
-zbus = { workspace = true }
+bluer.workspace = true
+tokio.workspace = true
+
+# 交叉编译到 RV1106：uclibc sysroot 里没有 libdbus，启用 dbus-rs 的 `vendored`
+# feature，由 libdbus-sys 从自带的 dbus 源码（1.14.4）静态构建并链接。
+# 这是 dbus-rs 官方推荐的交叉编译方式（见 libdbus-sys/cross_compile.md）。
+# 仅对交叉目标生效，host 构建仍用系统 libdbus。
+[target.armv7-unknown-linux-gnueabihf.dependencies]
+dbus = { version = "0.9", features = ["vendored"] }
 
 [dev-dependencies]

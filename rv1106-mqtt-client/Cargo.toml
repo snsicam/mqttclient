@@ -21,4 +21,7 @@ toml = "0.8"
 tungstenite = "0.26"
 log = "0.4"
 env_logger = "0.11"
-zbus = { version = "4", features = ["blocking"] }
+# 蓝牙：bluer（BlueZ 的 Rust 绑定）。`bluetoothd` feature 提供 Session/Adapter/GATT，
+# 内部走 dbus-rs（需目标侧 libdbus，见 docs 与 scripts/cross-dbus.sh）。
+bluer = { path = "bluer/bluer", features = ["bluetoothd"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }

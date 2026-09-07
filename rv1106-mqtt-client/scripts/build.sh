@@ -35,6 +35,12 @@ done
 # 必须用 uclibc 工具链：板子 rootfs 为 uclibc，gnu(glibc) 产物依赖 libc.so.6 /
 # ld-linux-armhf.so.3 无法运行。uclibc 缺失的 getauxval 与 posix_spawn* 辅助函数
 # 由 cross/ 下桩库补齐（libgetauxval.a / libposix_spawn.a，见 .cargo/config.toml）。
+#
+# 蓝牙（bluer → dbus-rs）：uclibc sysroot 内没有 libdbus，因此对交叉目标启用
+# dbus 的 `vendored` feature（见 crates/mqtt-client/Cargo.toml 的
+# [target.armv7-unknown-linux-gnueabihf.dependencies]），由 libdbus-sys 从自带
+# 源码静态构建 libdbus。需要 CC_armv7_unknown_linux_gnueabihf（下面已导出）指向
+# 交叉 gcc，产物不依赖板子上的 libdbus-1.so。
 TARGET="armv7-unknown-linux-gnueabihf"
 GCC_NAME="arm-rockchip830-linux-uclibcgnueabihf-gcc"
 TOOLCHAIN_DIR="${RV1106_TOOLCHAIN:-/opt/toolchain/arm-rockchip830-linux-uclibcgnueabihf}"

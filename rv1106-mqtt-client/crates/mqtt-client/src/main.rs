@@ -76,10 +76,13 @@ fn main() {
     mqtt_client::blufi::init::init_bluetooth(&cfg.blufi);
 
     // 蓝牙配网 worker（阶段 4：真实 GATT 链路）
+    // 注意：`blufi_cmd_tx` 必须存活到进程结束——worker 的命令通道靠它保持连接，
+    // 一旦发送端被 drop，`cmd_rx.recv_timeout` 会立即返回 Disconnected，worker 在
+    // 处理任何 APP 帧之前就退出，导致「手机写了但设备收不到」。故放在 if 块外持有。
+    use mqtt_client::blufi::{BluFiWorker, BlufiCmd, BlufiEvent};
+    let (blufi_cmd_tx, blufi_cmd_rx) = mpsc::channel::<BlufiCmd>();
+    let (blufi_ev_tx, blufi_ev_rx) = mpsc::channel::<BlufiEvent>();
     if cfg.blufi.enabled {
-        use mqtt_client::blufi::{BluFiWorker, BlufiCmd, BlufiEvent};
-        let (blufi_cmd_tx, blufi_cmd_rx) = mpsc::channel::<BlufiCmd>();
-        let (blufi_ev_tx, blufi_ev_rx) = mpsc::channel::<BlufiEvent>();
         let link = mqtt_client::blufi::gatt::start_gatt(&cfg.blufi, &cfg.device.id);
         let _blufi = BluFiWorker::spawn_with_link(
             cfg.blufi.clone(),
@@ -99,8 +102,9 @@ fn main() {
                 }
             }
         });
-        let _ = blufi_cmd_tx; // 预留：后续用于下发 StopConfig
     }
+    // 保留 cmd 发送端（后续可下发 StopConfig / 进入配网指令）；不 drop 以免 worker 退出
+    let _blufi_cmd = blufi_cmd_tx;
 
     // 共享状态与通道
     let app_state = Arc::new(Mutex::new(AppState::default()));
