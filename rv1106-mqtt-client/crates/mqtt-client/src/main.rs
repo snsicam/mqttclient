@@ -22,6 +22,88 @@ use mqtt_client::{AppConfig, AppState};
 use myrtio_mqtt::runtime::{MqttRuntime, PublishRequest};
 use myrtio_mqtt::{LastWill, MqttClient, MqttOptions, QoS};
 
+/// 把蓝牙广播名写入 `/etc/bluetooth/main.conf` 的 `Name` 字段（BlueZ 读取该值作为适配器别名），
+/// 使系统侧 bluetoothd 的别名与本应用广播名保持一致。**仅写不读**——本应用广播仍由
+/// `gatt::start_gatt` 的 `local_name` 决定，此文件同步只为与系统侧一致。
+///
+/// 写入策略：已存在未注释的 `Name =` 行则替换其值为最新；否则插入到 `[General]` 段首行之后；
+/// 连 `[General]` 段都没有则补一个。文件不存在/不可读/不可写时仅告警，不阻断启动。
+fn sync_bluetooth_main_conf(name: &str) {
+    const PATH: &str = "/etc/bluetooth/main.conf";
+    let content = match std::fs::read_to_string(PATH) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("bluetooth: read {PATH} failed: {e} — skip name sync");
+            return;
+        }
+    };
+    let new_line = format!("Name = {name}");
+
+    // 已存在未注释的 Name = 行 → 替换第一处
+    if content.lines().any(is_name_assignment) {
+        let mut out = String::new();
+        let mut replaced = false;
+        for line in content.lines() {
+            if !replaced && is_name_assignment(line) {
+                out.push_str(&new_line);
+                out.push('\n');
+                replaced = true;
+            } else {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        write_main_conf(PATH, &out, name);
+        return;
+    }
+
+    // 无 Name = 行：插入到 [General] 段首行之后（bluetoothd 按段解析，必须落在 [General] 内）
+    if let Some(pos) = content.lines().position(|l| l.trim() == "[General]") {
+        let mut out = String::new();
+        for (i, line) in content.lines().enumerate() {
+            out.push_str(line);
+            out.push('\n');
+            if i == pos {
+                out.push_str(&new_line);
+                out.push('\n');
+            }
+        }
+        write_main_conf(PATH, &out, name);
+        return;
+    }
+
+    // 连 [General] 段都没有：整文件后补段
+    let mut out = String::from(&content);
+    if !content.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("[General]\n");
+    out.push_str(&new_line);
+    out.push('\n');
+    write_main_conf(PATH, &out, name);
+}
+
+/// 判断一行是否为未注释的 `Name =` 赋值（忽略大小写与空白）。
+fn is_name_assignment(line: &str) -> bool {
+    let t = line.trim_start();
+    if t.starts_with('#') {
+        return false;
+    }
+    match t.strip_prefix("Name") {
+        Some(rest) => rest.starts_with('=') || rest.trim_start().starts_with('='),
+        None => false,
+    }
+}
+
+/// 回写 main.conf 并打印结果日志。
+fn write_main_conf(path: &str, content: &str, name: &str) {
+    if let Err(e) = std::fs::write(path, content) {
+        log::warn!("bluetooth: write {path} failed: {e} — skip name sync");
+    } else {
+        log::info!("bluetooth: synced name {name:?} -> {path}");
+    }
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     // 启动即打印版本与编译时间，便于部署后从日志确认烧录的是哪个构建。
@@ -91,6 +173,9 @@ fn main() {
     let (blufi_ev_tx, blufi_ev_rx) = mpsc::channel::<BlufiEvent>();
     if cfg.blufi.enabled {
         let bt_name = cfg.blufi.bluetooth_name(&cfg.mqtt.model, &cfg.device.id);
+        // 把蓝牙广播名同步写入 /etc/bluetooth/main.conf 的 Name 字段，
+        // 使系统侧 bluetoothd 的适配器别名与本应用广播名一致（仅写不读）。
+        sync_bluetooth_main_conf(&bt_name);
         let link = mqtt_client::blufi::gatt::start_gatt(&cfg.blufi, &bt_name);
         let _blufi = BluFiWorker::spawn_with_link(
             cfg.blufi.clone(),

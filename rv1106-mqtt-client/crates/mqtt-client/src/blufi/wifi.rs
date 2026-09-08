@@ -3,7 +3,7 @@
 //! 通过 `std::process::Command` 调用 `wpa_cli -i <iface> ...` 完成扫描/配网。
 //! v1 不引入第三方 wait-timeout，超长命令由上层轮询超时兜底。
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -141,6 +141,44 @@ impl WifiManager {
         Ok(merged)
     }
 
+    /// 仅触发一次扫描（`wpa_cli scan`），**不等结果、不读 `scan_results`**。
+    /// 用于「蓝牙连接后预热扫描」等场景：异步扫描由 wpa_supplicant 后台完成，
+    /// APP 随后发 `GET_WIFI_LIST` 时 `scan()` 能直接拿到较新的结果。
+    /// 触发失败仅告警（如正在扫描中被临时拒绝），不阻断业务流程。
+    pub fn trigger_scan(&self) {
+        match self.run(&["scan"]) {
+            Ok(_) => log::info!("blufi: triggered wpa_cli scan (bluetooth connected)"),
+            Err(e) => log::warn!("blufi: scan trigger failed (ignored): {e}"),
+        }
+    }
+
+    /// 选网后确保 wlan0 拿到**新网络**的 IP。设备侧通常已有 `udhcpc -i <iface>` 在跑，
+    /// wpa_supplicant 切到新网络后旧 udhcpc 仍持旧租约（busybox 续期要等租约 1/2~7/8 时长），
+    /// 不会立刻去新网络重新要 IP —— 这正是「配网完成但 IP 不更新」的根因。
+    /// 故这里**重启** udhcpc：先按命令行匹配杀掉已有实例（避免多个 DHCP 客户端争抢接口），
+    /// 再 spawn 新实例，新实例会在刚关联的接口上重新 DHCP 拿到新 IP。
+    /// 后台运行（spawn，不等结果、stdout/stderr 重定向到 /dev/null）。
+    /// 依赖 busybox 的 `pkill` 与 `default.script`（配置地址/路由）。
+    fn start_dhcp(&self) {
+        // 杀掉已有 udhcpc（按命令行匹配本接口）；pkill 不存在/无匹配则忽略，照常启动新实例。
+        let _ = Command::new("pkill")
+            .args(["-f", &format!("udhcpc.*{}", self.iface)])
+            .status();
+        let pidfile = format!("/var/run/udhcpc.{}.pid", self.iface);
+        match Command::new("udhcpc")
+            .arg("-i")
+            .arg(&self.iface)
+            .arg("-p")
+            .arg(&pidfile)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => log::info!("blufi: restarted udhcpc -i {} (pid {})", self.iface, child.id()),
+            Err(e) => log::warn!("blufi: start udhcpc failed (ignored): {e}"),
+        }
+    }
+
     /// 配网：通过 `wpa_cli` 把 ssid/pwd 写入 wpa_supplicant（`set_network` → `save_config`），
     /// 再 `reconfigure` 重载生效，随后 `select_network` 主动切换到刚配置的网络（禁用其余网络），
     /// 最后轮询 `status` 等待拿到 IP。
@@ -162,6 +200,9 @@ impl WifiManager {
                 );
             }
         }
+        // 选网后启动 DHCP 客户端：wpa_supplicant 只负责认证/关联，IP 地址需 udhcpc 分配，
+        // 否则 `status` 永远没有 `ip_address=`，`connect` 只能靠超时退出。
+        self.start_dhcp();
         let deadline = Instant::now() + self.connect_timeout;
         loop {
             match self.run(&["status"]) {

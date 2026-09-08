@@ -16,6 +16,8 @@
 //! 10 字节的主机名（`M1S-Ge3370`），要么与「module + 设备 id」规则无关。bluer 的
 //! `local_name` 把名字交给 BlueZ 写进 scan response（Complete Local Name，31 字节
 //! 预算），不受 10 字节内核限制——故只要调用方传入的名字源正确，app 即显示全名。
+//! 传入的广播名同时由 `main.rs::sync_bluetooth_main_conf` 写回 `/etc/bluetooth/main.conf`
+//! 的 `Name` 字段（仅写不读），使系统侧 bluetoothd 别名与本应用广播名一致。
 //!
 //! 线程模型：`start_gatt` 启动独立 `blufi-gatt` 线程，在其中建 tokio
 //! `current_thread` runtime 并 `block_on` 异步 GATT 服务端（bluer 是异步 API，

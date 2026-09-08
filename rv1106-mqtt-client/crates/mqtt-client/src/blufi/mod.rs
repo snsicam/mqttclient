@@ -405,6 +405,9 @@ impl WorkerCtx {
             std::thread::sleep(Duration::from_millis(100));
             let ver = encode_version(self.cfg.version_major, self.cfg.version_minor);
             self.send_frame(PKG_DATA, ftype::VERSION, fc::DIRECTION, &ver);
+            // 蓝牙连接后预热扫描：让 wpa_supplicant 后台刷新附近 AP，
+            // APP 随后发 GET_WIFI_LIST 时能拿到更新结果（不等结果，仅触发）。
+            self.wifi.trigger_scan();
             log::debug!("blufi: app reconnected — reset tx sequence & resend version (§2 重连清零)");
         }
     }
