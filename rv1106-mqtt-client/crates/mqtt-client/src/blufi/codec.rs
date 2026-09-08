@@ -72,18 +72,20 @@ pub fn encode_scan_list_fitting(items: &[ScanItem], max_bytes: usize) -> Vec<u8>
     v
 }
 
-/// 连接状态报告 0xF 的 data 段。**与 ESP32 参考实现实抓包一致：仅 2 字节**
-/// `[0x01(opmode=STA), sta_state]`（`0x0` 已连有 IP / `0x1` 断开 / `0x2` 连接中 / `0x3` 已连无 IP）。
+/// 连接状态报告 0xF 的 data 段：**3 字节**
+/// `[0x01(opmode=STA), sta_state, 0x00(SoftAP 连接数)]`
+/// （`0x0` 已连有 IP / `0x1` 断开 / `0x2` 连接中 / `0x3` 已连无 IP）
 ///
-/// 即等价 `esp_blufi_send_wifi_conn_report(opmode, state, 0, NULL)` —— 第四参为 NULL 时
-/// 不携带 SoftAP 连接数 / SSID / BSSID，实测报文为 `3F 00 05 02 01 00`。
-///
-/// 为什么不带 SSID/BSSID：`BlufiClient` 库在 STA 模式下并不消费 `data[2]` 的 SoftAP 数，
-/// 而是把 `data[2]` 起按「SSID 长度」解析。若携带额外字段，库会把 `data[2]=0x00` 当成
-/// SSID 长度、`data[3]` 当成 BSSID 长度而解析错位，导致 `onDeviceStatusResponse` 的
-/// `status != STATUS_SUCCESS`，APP 判定「配网失败」（设备侧其实已连上）。
+/// 依据 `BlufiClientImpl.parseWifiState()`：
+/// 1. 先判 `data.length < 3` → 直接 `onStatusResponse(CODE_INVALID_DATA)`，
+//     **因此不能只发 2 字节**（早期按 ESP32 实抓包 `3F 00 05 02 01 00` 只发 2 字节会失败）；
+/// 2. 依次读 opMode / staConnectionStatus / softAPConnectionCount；
+/// 3. 剩余字节按 **(infoType, len, value) 三元组** 循环解析（SSID/BSSID 属可选扩展，
+///    infoType 见 `BlufiParameter.Type.Data.SUBTYPE_STA_WIFI_SSID` 等）。
+///    所以「直接拼 SSID 字节」也会被当 infoType/len 而解析失败——两者都不对。
+/// 不带扩展字段时解析结束即 `STATUS_SUCCESS`，APP 判配网成功。
 pub fn encode_connect_state(sta_state: u8) -> Vec<u8> {
-    vec![0x01, sta_state]
+    vec![0x01, sta_state, 0x00]
 }
 
 /// 版本帧 0x10 的 data 段：`[major, minor]`。
@@ -167,16 +169,16 @@ mod tests {
 
     #[test]
     fn connect_state_encode() {
-        // 与 ESP32 参考实现一致：仅 [opmode=STA, sta_state]
-        assert_eq!(encode_connect_state(0x00), vec![1, 0]); // 已连有 IP
-        assert_eq!(encode_connect_state(0x01), vec![1, 1]); // 断开
+        // 与库 parseWifiState 一致：3 字节 [opmode=STA, sta_state, softAP 连接数=0]
+        assert_eq!(encode_connect_state(0x00), vec![1, 0, 0]); // 已连有 IP
+        assert_eq!(encode_connect_state(0x01), vec![1, 1, 0]); // 断开
     }
 
     #[test]
-    fn connect_state_is_minimal_two_bytes() {
-        // 回归：不得携带 SoftAP 数 / SSID / BSSID。
-        // 库会把 data[2] 当 SSID 长度解析，多带字段会导致 status != SUCCESS、APP 判失败。
-        assert_eq!(encode_connect_state(0x00).len(), 2);
+    fn connect_state_has_at_least_three_bytes() {
+        // 回归：库 parseWifiState 先判 data.length < 3 → CODE_INVALID_DATA，
+        // 少于 3 字节（如只发 opmode+state）会导致 APP 判配网失败。
+        assert_eq!(encode_connect_state(0x00).len(), 3);
     }
 
     #[test]

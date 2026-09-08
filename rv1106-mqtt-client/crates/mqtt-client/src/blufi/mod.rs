@@ -83,6 +83,11 @@ pub struct BluFiConfig {
     pub wpa_conf: String,
     #[serde(default = "default_ack_repeat")]
     pub ack_repeat: u8,
+    /// 扫描列表单帧字节上限。`0` = 不限：超过 255 字节时由 `send_data` 自动按 BluFi
+    /// 分片发送（对端 BlufiClient 支持重组，不丢热点）。
+    /// 仅当对端 APP 收到分片即断连时，才设为 `255` 退化为单帧（丢弃装不下的最弱热点）。
+    #[serde(default = "default_scan_single_frame_bytes")]
+    pub scan_single_frame_bytes: usize,
     #[serde(default = "default_ack_interval")]
     pub ack_interval_ms: u64,
     /// 安全模式字符串：`plain`/`crc16`/`aes`/`dhaes`（v1 仅 plain 生效）。
@@ -115,6 +120,7 @@ impl Default for BluFiConfig {
             wpa_ctrl: default_wpa_ctrl(),
             wpa_conf: default_wpa_conf(),
             ack_repeat: default_ack_repeat(),
+            scan_single_frame_bytes: default_scan_single_frame_bytes(),
             ack_interval_ms: default_ack_interval(),
             security: default_security(),
             version_major: default_ver_major(),
@@ -179,6 +185,9 @@ fn default_wpa_conf() -> String {
 }
 fn default_ack_repeat() -> u8 {
     3
+}
+fn default_scan_single_frame_bytes() -> usize {
+    0 // 0 = 不限，超 255 走分片（不丢热点）
 }
 fn default_ack_interval() -> u64 {
     500
@@ -446,16 +455,19 @@ impl WorkerCtx {
         }
     }
 
-    /// 连发 N 帧同一内容（配网回执 / 失败文本）：
-    /// - **N 帧复用同一个 sequence**：这是同一条消息的冗余重传，不是 N 条消息；
-    ///   每帧各占一个 seq 会被对端当作独立消息（表现为 seq 2,3,4 而非 2,2,2）。
-    /// - 间隔 `ack_interval_ms`；**最后一帧之后不再等待**，避免白白拖慢后续配网流程。
+    /// 连发 N 帧同一内容（配网回执 / 失败文本）。
+    ///
+    /// **每帧 sequence 必须递增，不能复用**：`BlufiClientImpl.parseNotification()` 严格校验
+    /// `sequence == mReadSequence.incrementAndGet() & 0xff`，重复 seq 会打印
+    /// "read sequence wrong" 并丢弃该帧；且计数器已自增，会让**后续所有帧（含 0xF 状态报告）
+    /// 全部错位被丢弃**，APP 因此判定配网失败。故这里逐帧 `send_frame`（seq 自增）。
+    ///
+    /// 间隔 `ack_interval_ms`；**最后一帧之后不再等待**，避免白白拖慢后续配网流程。
     fn send_repeat(&mut self, subtype: u8, data: &[u8]) {
         let repeat = self.cfg.ack_repeat.max(1);
         let interval = Duration::from_millis(self.cfg.ack_interval_ms);
-        let seq = self.next_seq();
         for i in 0..repeat {
-            self.send_frame_seq(PKG_DATA, subtype, fc::DIRECTION, data, seq);
+            self.send_frame(PKG_DATA, subtype, fc::DIRECTION, data);
             if i + 1 < repeat {
                 thread::sleep(interval);
             }
@@ -533,15 +545,25 @@ impl WorkerCtx {
                         // APP 支持分片后，改回 encode_scan_list(&items) 全量即可，send_data
                         // 会自动按 255 切片（每片 data ≤ 255，data_len 字段不截断）。
                         items.sort_by(|a, b| b.rssi.cmp(&a.rssi));
-                        let full_len = encode_scan_list(&items).len();
-                        let data = encode_scan_list_fitting(&items, 255);
-                        if data.len() < full_len {
-                            log::warn!(
-                                "blufi: scan list {} items ({}B) exceeds single-frame limit 255B; \
-                                 truncated to {}B (dropped weakest) — app lacks BluFi fragment support",
-                                items.len(), full_len, data.len()
-                            );
-                        }
+                        // 列表超 255 字节时由 send_data 自动按 BluFi 分片（每片 ≤255、
+                        // data_len 不截断），对端 BlufiClient 支持分片重组 → **不丢热点**。
+                        // 仅当对端异常（收到分片即断连）时，才把 `scan_single_frame_bytes`
+                        // 设为 255 退化为单帧丢弃最弱热点。
+                        let data = match self.cfg.scan_single_frame_bytes {
+                            0 => encode_scan_list(&items),
+                            max_bytes => {
+                                let full_len = encode_scan_list(&items).len();
+                                let d = encode_scan_list_fitting(&items, max_bytes);
+                                if d.len() < full_len {
+                                    log::warn!(
+                                        "blufi: scan list {} items ({}B) exceeds single-frame limit {}B; \
+                                         truncated to {}B (dropped weakest)",
+                                        items.len(), full_len, max_bytes, d.len()
+                                    );
+                                }
+                                d
+                            }
+                        };
                         self.send_data(PKG_DATA, ftype::WIFI_LIST, &data);
                     }
                     Err(e) => {
@@ -731,10 +753,10 @@ mod tests {
         assert_eq!(frame[2], 1, "重连后第一帧 seq 应为 1，实际 {}", frame[2]);
     }
 
-    /// 连发 N 帧（回执 / 失败文本）应**复用同一个 sequence**：
-    /// 这是同一条消息的冗余重传，不是 N 条消息，seq 只能自增 1。
+    /// 连发 N 帧（回执 / 失败文本）**sequence 必须递增**：
+    /// 库 parseNotification 严格校验 read sequence，重复 seq 会丢弃该帧并让后续帧错位。
     #[test]
-    fn repeat_frames_share_one_sequence() {
+    fn repeat_frames_increment_sequence() {
         struct RecLink {
             sent: Arc<Mutex<Vec<Vec<u8>>>>,
         }
@@ -772,10 +794,11 @@ mod tests {
 
         let sent = sent.lock().unwrap();
         assert_eq!(sent.len(), 3, "应连发 3 帧");
-        for f in sent.iter() {
-            assert_eq!(f[2], 5, "重传帧必须复用同一 seq，实际 {}", f[2]);
-        }
-        assert_eq!(ctx.seq_out, 6, "重传 N 帧只应让 seq 自增 1");
+        // seq 必须逐帧递增：库按 mReadSequence.incrementAndGet() 严格校验
+        assert_eq!(sent[0][2], 5);
+        assert_eq!(sent[1][2], 6, "seq 必须递增，重复 seq 会被库丢弃");
+        assert_eq!(sent[2][2], 7);
+        assert_eq!(ctx.seq_out, 8, "3 帧后 seq 应为 8");
     }
 
     #[test]
