@@ -129,16 +129,39 @@ impl WifiManager {
             }
             std::thread::sleep(SCAN_READ_GAP);
         }
+        let summary: Vec<String> = merged
+            .iter()
+            .map(|s| format!("{} ({}dBm)", s.ssid, s.rssi))
+            .collect();
+        log::info!(
+            "blufi: scan returned {} wifi network(s): [{}]",
+            merged.len(),
+            summary.join(", ")
+        );
         Ok(merged)
     }
 
     /// 配网：通过 `wpa_cli` 把 ssid/pwd 写入 wpa_supplicant（`set_network` → `save_config`），
-    /// 再 `reconfigure` 重载生效，最后轮询 `status` 等待拿到 IP。
+    /// 再 `reconfigure` 重载生效，随后 `select_network` 主动切换到刚配置的网络（禁用其余网络），
+    /// 最后轮询 `status` 等待拿到 IP。
     /// WiFi 配置完全由 wpa_supplicant 自身管理，程序不碰配置文件、不假定路径。
     pub fn connect(&self, ssid: &str, pwd: Option<&str>) -> Result<(), WifiError> {
         self.configure_via_cli(ssid, pwd)?;
         log::info!("blufi: reloading wpa_supplicant to apply config for ssid={ssid}");
         self.reload_wpa_supplicant()?;
+        // 配网成功后主动切换到刚配置的网络：`select_network` 会禁用其它网络并强制关联目标
+        // SSID（等价于 APP/手机侧的「切换 WiFi」），避免仅 enable 时仍停留在旧网络或被自动选择忽略。
+        match self.find_network_id(ssid)? {
+            Some(id) => {
+                self.run_checked(&["select_network", &id.to_string()])?;
+                log::info!("blufi: selected network id={id} (ssid={ssid}) — switching now");
+            }
+            None => {
+                log::warn!(
+                    "blufi: configured network {ssid:?} not found after reconfigure, skip select_network"
+                );
+            }
+        }
         let deadline = Instant::now() + self.connect_timeout;
         loop {
             match self.run(&["status"]) {
