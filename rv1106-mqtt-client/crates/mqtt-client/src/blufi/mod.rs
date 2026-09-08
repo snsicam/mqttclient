@@ -74,13 +74,6 @@ pub struct BluFiConfig {
     pub scan_timeout_ms: u64,
     #[serde(default = "default_conn_to")]
     pub connect_timeout_ms: u64,
-    #[serde(default = "default_iface")]
-    pub wpa_iface: String,
-    #[serde(default = "default_wpa_ctrl")]
-    pub wpa_ctrl: String,
-    /// wpa_supplicant 配置文件路径，配网后将 SSID/密码写入此处（默认 /data/wpa_supplicant.conf）。
-    #[serde(default = "default_wpa_conf")]
-    pub wpa_conf: String,
     #[serde(default = "default_ack_repeat")]
     pub ack_repeat: u8,
     /// 扫描列表单帧字节上限。`0` = 不限：超过 255 字节时由 `send_data` 自动按 BluFi
@@ -116,9 +109,6 @@ impl Default for BluFiConfig {
             dbus_timeout_ms: default_dbus_to(),
             scan_timeout_ms: default_scan_to(),
             connect_timeout_ms: default_conn_to(),
-            wpa_iface: default_iface(),
-            wpa_ctrl: default_wpa_ctrl(),
-            wpa_conf: default_wpa_conf(),
             ack_repeat: default_ack_repeat(),
             scan_single_frame_bytes: default_scan_single_frame_bytes(),
             ack_interval_ms: default_ack_interval(),
@@ -172,16 +162,6 @@ fn default_scan_to() -> u64 {
 }
 fn default_conn_to() -> u64 {
     30000
-}
-fn default_iface() -> String {
-    "wlan0".into()
-}
-fn default_wpa_ctrl() -> String {
-    "/var/run/wpa_supplicant/wlan0".into()
-}
-fn default_wpa_conf() -> String {
-    // 设备实际使用的配置目录是 /data（/etc 下并非 wpa_supplicant 生效的配置）
-    "/data/wpa_supplicant.conf".into()
 }
 fn default_ack_repeat() -> u8 {
     3
@@ -419,7 +399,7 @@ impl WorkerCtx {
         if self.link.take_new_session() {
             self.seq_out = SEQ_AFTER_VERSION;
             self.asm = FragmentAssembler::new();
-            log::info!(
+            log::debug!(
                 "blufi: app reconnected — reset tx sequence to {} (§2 重连清零)",
                 SEQ_AFTER_VERSION
             );
@@ -491,7 +471,8 @@ impl WorkerCtx {
     }
 
     fn on_app_frame(&mut self, bytes: &[u8]) {
-        log::info!("[blufi] << rx raw {} bytes: {:02x?}", bytes.len(), bytes);
+        // debug 级：APP 下发的原始字节里含配网明文密码（SSID:..,PWD:..），默认不输出
+        log::debug!("[blufi] << rx raw {} bytes: {:02x?}", bytes.len(), bytes);
         let f = match BluFiFrame::decode(bytes) {
             Ok(f) => f,
             Err(e) => {
@@ -586,13 +567,14 @@ impl WorkerCtx {
             ftype::CUSTOM_DATA => {
                 match parse_provisioning(payload) {
                     Ok(prov) => {
-                        // 按需求打印明文密码（含敏感信息，日志外发前请脱敏）
-                        log::info!(
+                        // debug 级：含明文密码，默认不输出（排查时用
+                        // RUST_LOG=mqtt_client::blufi=debug 打开，注意日志脱敏）
+                        log::debug!(
                             "blufi: provisioning request ssid={} pwd={} ip={:?} port={:?}",
                             prov.ssid, prov.pwd, prov.ip, prov.port
                         );
-                        // B2：回执 ×N（同一 sequence，间隔 ack_interval_ms）
-                        log::info!(
+                        // B2：回执 ×N（间隔 ack_interval_ms）
+                        log::debug!(
                             "blufi: → app 回执 ×{}: \"{}\"",
                             self.cfg.ack_repeat.max(1),
                             String::from_utf8_lossy(RECEIVED_MSG)
@@ -605,25 +587,23 @@ impl WorkerCtx {
                             Some(prov.pwd.as_str())
                         };
                         let result = self.wifi.connect(&prov.ssid, pwd);
-                        // 配网结束：把配置文件（含路径）打出来便于排查；psk 明文已打码
-                        log::info!(
-                            "blufi: 配置文件 {} 内容:\n{}",
-                            self.wifi.conf_path(),
-                            self.wifi.dump_conf()
+                        // 配网结束：通过 wpa_cli 列出已配置网络确认（不依赖配置文件路径）。
+                        log::debug!(
+                            "blufi: 已配置网络(list_networks):\n{}",
+                            self.wifi.list_networks_text()
                         );
                         match result {
-                            Ok(bssid) => {
-                                // 0xF 仅 2 字节 [opmode=STA, state=已连有IP]（对齐 ESP32 参考实现）
+                            Ok(()) => {
+                                // 0xF 仅 3 字节 [opmode=STA, state=已连有IP, 0x00]（对齐 BlufiClient 解析）
                                 let st = encode_connect_state(0x00);
-                                log::info!(
+                                log::debug!(
                                     "blufi: → app 0xF 状态报告 data={:02x?} (opmode=STA, state=已连有IP)",
                                     st
                                 );
                                 self.send_data(PKG_DATA, ftype::CONNECT_STATE, &st);
                                 log::info!(
-                                    "blufi: provisioning SUCCESS ssid={} bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} — 已回 0xF(2B, state=已连有IP)",
-                                    prov.ssid, bssid[0], bssid[1], bssid[2], bssid[3], bssid[4],
-                                    bssid[5]
+                                    "blufi: provisioning SUCCESS ssid={} — 已回 0xF(3B, state=已连有IP)",
+                                    prov.ssid
                                 );
                                 let _ = self.event_tx.send(BlufiEvent::WifiConnected {
                                     ssid: prov.ssid.clone(),
@@ -635,7 +615,7 @@ impl WorkerCtx {
                                     "blufi: provisioning FAILED ssid={} reason={} — 回 \"Wifi connection failed\" ×{}",
                                     prov.ssid, e, self.cfg.ack_repeat.max(1)
                                 );
-                                log::warn!(
+                                log::debug!(
                                     "blufi: → app 失败文本 ×{}: \"{}\"",
                                     self.cfg.ack_repeat.max(1),
                                     String::from_utf8_lossy(FAILED_MSG)

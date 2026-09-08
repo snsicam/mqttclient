@@ -34,4 +34,7 @@ tokio.workspace = true
 [target.armv7-unknown-linux-gnueabihf.dependencies]
 dbus = { version = "0.9", features = ["vendored"] }
 
+[build-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
 [dev-dependencies]

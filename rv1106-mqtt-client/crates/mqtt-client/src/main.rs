@@ -24,6 +24,13 @@ use myrtio_mqtt::{LastWill, MqttClient, MqttOptions, QoS};
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // 启动即打印版本与编译时间，便于部署后从日志确认烧录的是哪个构建。
+    log::info!(
+        "mqtt-client v{} (git {}) built at {}",
+        env!("CARGO_PKG_VERSION"),
+        env!("GIT_HASH"),
+        env!("BUILD_TIME")
+    );
     // 配置路径解析优先级：命令行参数 > MQTT_CLIENT_CONFIG 环境变量 > 默认相对路径
     let path = std::env::args()
         .nth(1)
@@ -164,9 +171,10 @@ async fn run_session(
     options = options
         .with_keep_alive(Duration::from_secs(u64::from(cfg.mqtt.keepalive_secs)))
         .with_clean_session(cfg.mqtt.clean_session);
-    if let Some(u) = &cfg.mqtt.username {
-        options = options.with_credentials(u, cfg.mqtt.password.as_deref().unwrap_or(""));
-    }
+    // username 未显式配置时，默认等于设备 id（G+序列号，随板载序列号动态生成，
+    // 与 topic 中的设备标识一致）——即「和 id 一样是动态的」，每台设备自动用自身序列号作为 MQTT 用户名。
+    let username = cfg.mqtt.username.as_deref().unwrap_or(&cfg.device.id);
+    options = options.with_credentials(username, cfg.mqtt.password.as_deref().unwrap_or(""));
     // LWT：断线遗嘱（MXS 协议 topic）
     let lwt_topic: &'static str = Box::leak(cfg.lwt_topic().into_boxed_str());
     static LWT_PAYLOAD: &[u8] = b"";

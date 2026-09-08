@@ -178,7 +178,7 @@ pub struct DownloadConfig {
 impl Default for MqttConfig {
     fn default() -> Self {
         Self {
-            broker: "127.0.0.1".into(),
+            broker: "121.199.168.145".into(),
             port: 1883,
             keepalive_secs: 60,
             clean_session: false,

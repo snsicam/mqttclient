@@ -168,14 +168,15 @@ impl BleLink for GattBleLink {
                 *g = Some(bytes.to_vec());
             }
         }
-        // info 级：发出去的每一帧都可见（排查手机收不到/收错时看这里）
-        log::info!(
+        // debug 级：每帧两行，正常运行较吵；排查手机收不到/收错时开
+        // RUST_LOG=mqtt_client::blufi=debug 查看
+        log::debug!(
             "bluetooth: [tx->app] send {} bytes: {:02x?}",
             bytes.len(),
             bytes
         );
         // 字符形式：文本类帧（回执 / 失败文本）可直接读出内容
-        log::info!(
+        log::debug!(
             "bluetooth: [tx->app] text: \"{}\"",
             bytes_to_text(bytes)
         );
@@ -325,7 +326,7 @@ async fn serve(
                         method: CharacteristicWriteMethod::Fun(Box::new(move |new_value, req| {
                             let tx = char1_tx.clone();
                             async move {
-                                log::info!(
+                                log::debug!(
                                     "bluetooth: [char1] write {} bytes from {} (mtu {}): {:02x?}",
                                     new_value.len(),
                                     req.device_address,
@@ -422,7 +423,7 @@ async fn notify_session(
     // BlueZ 在 StartNotify() 返回前可能尚未完成内部就绪，稍延迟再发首帧，避免丢帧。
     tokio::time::sleep(RESEND_DELAY).await;
     if let Some(data) = last.lock().ok().and_then(|g| g.clone()) {
-        log::info!(
+        log::debug!(
             "bluetooth: [tx->app] resend last frame {} bytes: {:02x?}",
             data.len(),
             data
