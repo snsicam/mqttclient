@@ -31,7 +31,7 @@ pub const PKG_DATA: u8 = 0x01;
 
 /// Type 字节 = `(subtype << 2) | pkg_type`（★易错：subtype 是功能码，不是 Type 字节本身）。
 #[inline]
-pub fn type_byte(pkg_type: u8, subtype: u8) -> u8 {
+pub const fn type_byte(pkg_type: u8, subtype: u8) -> u8 {
     (subtype << 2) | (pkg_type & 0x03)
 }
 #[inline]
@@ -207,6 +207,11 @@ pub fn split_for_tx(
     data: &[u8],
     max_payload: usize,
 ) -> Vec<BluFiFrame> {
+    // BluFi 帧 data_len 为 1 字节 u8（上限 255）；每片 data 不得超过 255，否则 encode
+    // 时 `data.len() as u8` 截断，APP 解码错位（长度字段与后续 data 长度不一致）。
+    // 与 BLE MTU 无关（517 足以承载 259 字节帧），故强制每片上限 255，忽略调用方
+    // 传入的更大值（如历史 MTU-3=514）。
+    let max_payload = max_payload.min(255);
     let mut frames = Vec::new();
     if data.len() <= max_payload {
         frames.push(BluFiFrame::new(
@@ -284,6 +289,33 @@ mod tests {
         let frames = split_for_tx(PKG_DATA, ftype::WIFI_LIST, fc::DIRECTION, 1, &payload, 5);
         assert!(frames.len() >= 2);
         assert!(frames[0].frame_ctrl & fc::FRAGMENTED != 0);
+        let mut asm = FragmentAssembler::new();
+        let mut result = None;
+        for fr in &frames {
+            if let Ok(Some(p)) = asm.feed(fr) {
+                result = Some(p);
+            }
+        }
+        assert_eq!(result, Some(payload));
+    }
+
+    #[test]
+    fn fragment_large_payload_respects_u8_len() {
+        // data_len 为 u8，每片 data 必须 ≤ 255，否则 encode 时长度字段截断、APP 解码错位。
+        let payload: Vec<u8> = (0u8..=255).cycle().take(600).collect();
+        // 即便调用方误传 514（历史值），min(255) 也应保证每片 ≤ 255
+        let frames = split_for_tx(PKG_DATA, ftype::WIFI_LIST, fc::DIRECTION, 1, &payload, 514);
+        assert!(frames.len() >= 3, "600 字节应分多片");
+        for f in &frames {
+            assert!(f.data.len() <= 255, "每片 data 必须 ≤ 255");
+            let enc = f.encode();
+            assert_eq!(
+                enc[3] as usize,
+                f.data.len(),
+                "data_len 字段(enc[3])不得与真实 data 长度不一致"
+            );
+        }
+        // 重组应与原文一致
         let mut asm = FragmentAssembler::new();
         let mut result = None;
         for fr in &frames {

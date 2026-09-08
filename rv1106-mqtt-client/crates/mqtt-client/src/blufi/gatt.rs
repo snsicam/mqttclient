@@ -28,6 +28,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::mpsc::{self, TryRecvError};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -41,7 +42,7 @@ use bluer::{Session, Uuid};
 use futures::FutureExt;
 use tokio::sync::broadcast;
 
-use crate::blufi::{BleLink, BleLinkError, BluFiConfig};
+use crate::blufi::{frame::{type_byte, PKG_DATA, ftype}, BleLink, BleLinkError, BluFiConfig};
 
 /// BluFi 服务 UUID `0xFFFF`（128-bit 展开形式）。
 const SVC_UUID: Uuid = Uuid::from_u128(0x0000ffff_0000_1000_8000_00805f9b34fb);
@@ -49,6 +50,11 @@ const SVC_UUID: Uuid = Uuid::from_u128(0x0000ffff_0000_1000_8000_00805f9b34fb);
 const CHAR1_UUID: Uuid = Uuid::from_u128(0x0000ff01_0000_1000_8000_00805f9b34fb);
 /// 特征 `0xFF02`：设备 → APP（notify）。
 const CHAR2_UUID: Uuid = Uuid::from_u128(0x0000ff02_0000_1000_8000_00805f9b34fb);
+
+/// 版本帧 type 字节 = `PKG_DATA(0x01) | VERSION(0x10<<2)` = `0x41`。
+/// 仅此帧作为「APP 重连时补发」的缓存：扫描等分片（type `0x45`）不缓存，
+/// 否则重连会把上一次扫描的残留分片重发给新会话，导致 app 解析错乱。
+const VERSION_FRAME_TYPE: u8 = type_byte(PKG_DATA, ftype::VERSION);
 
 /// 下行（设备 → APP）广播通道容量。APP 未订阅时不积压（send 直接返回无接收者）。
 const OUTBOUND_CAP: usize = 64;
@@ -60,6 +66,21 @@ const RESEND_DELAY: Duration = Duration::from_millis(100);
 /// 广播名硬上限（scan response 31 字节预算，2 字节 AD 头 → 名字 ≤ 29）。
 /// 仅作安全兜底；名字过长由 BlueZ 在 scan response 阶段处理（与 `bt_ble_up.sh` 一致）。
 const NAME_MAX: usize = 29;
+
+/// 把字节流按**字符形式**展示：可打印 ASCII 原样输出，`\r`/`\n` 转义，
+/// 其余转为 `\xNN`。用于在日志里直接读出文本类帧（如回执 "Received SSID and password"），
+/// 而不必对着十六进制数。
+fn bytes_to_text(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| match b {
+            0x20..=0x7e => (*b as char).to_string(),
+            0x0d => "\\r".to_string(),
+            0x0a => "\\n".to_string(),
+            _ => format!("\\x{b:02x}"),
+        })
+        .collect()
+}
 
 /// 按 UTF-8 字符边界截断（避免切到多字节字符中间），长度按字节计。
 fn truncate_bytes(s: &str, max: usize) -> String {
@@ -90,6 +111,8 @@ pub fn start_gatt(cfg: &BluFiConfig, bluetooth_name: &str) -> Box<dyn BleLink> {
     let (outbound_tx, _outbound_rx) = broadcast::channel::<Vec<u8>>(OUTBOUND_CAP);
     // 最近一帧：APP 订阅 notify 时补发（VERSION 帧常早于订阅发出）
     let last = Arc::new(Mutex::new(None::<Vec<u8>>));
+    // APP 重连标志：新 notify 会话开始置位，worker 取走后重置发送 sequence（§2 重连清零）
+    let new_session = Arc::new(AtomicBool::new(false));
 
     let inbound_tx = Arc::new(Mutex::new(inbound_tx));
     let outbound_tx = Arc::new(Mutex::new(outbound_tx));
@@ -99,6 +122,7 @@ pub fn start_gatt(cfg: &BluFiConfig, bluetooth_name: &str) -> Box<dyn BleLink> {
     let g_inbound = inbound_tx.clone();
     let g_outbound = outbound_tx.clone();
     let g_last = last.clone();
+    let g_new_session = new_session.clone();
 
     thread::Builder::new()
         .name("blufi-gatt".into())
@@ -111,7 +135,7 @@ pub fn start_gatt(cfg: &BluFiConfig, bluetooth_name: &str) -> Box<dyn BleLink> {
                 }
             };
             rt.block_on(serve_loop(
-                &adapter, advertise, &local_name, g_inbound, g_outbound, g_last,
+                &adapter, advertise, &local_name, g_inbound, g_outbound, g_last, g_new_session,
             ));
         })
         .expect("spawn blufi-gatt");
@@ -120,6 +144,7 @@ pub fn start_gatt(cfg: &BluFiConfig, bluetooth_name: &str) -> Box<dyn BleLink> {
         inbound_rx,
         outbound_tx,
         last,
+        new_session,
     })
 }
 
@@ -128,19 +153,31 @@ pub struct GattBleLink {
     inbound_rx: mpsc::Receiver<Vec<u8>>,
     outbound_tx: Arc<Mutex<broadcast::Sender<Vec<u8>>>>,
     last: Arc<Mutex<Option<Vec<u8>>>>,
+    /// APP 重连标志：新 notify 会话开始时置位，由 worker 取走并重置发送 sequence（§2）。
+    new_session: Arc<AtomicBool>,
 }
 
 impl BleLink for GattBleLink {
     fn send(&self, bytes: &[u8]) -> Result<(), BleLinkError> {
-        // 缓存最后一帧，APP 后续订阅 notify 时可补发
-        if let Ok(mut g) = self.last.lock() {
-            *g = Some(bytes.to_vec());
+        // 仅「版本帧(0x41)」作为可重发帧缓存：APP 重连 enable notify 时补发它，
+        // 避免首帧（版本帧）在订阅前发出而丢失；其余帧（含 WIFI_LIST 分片、ACK、
+        // 回执、错误帧）不缓存，否则重连会把上一次扫描的残留分片重发给新会话，
+        // 导致 app 解析错乱、提示错误。
+        if bytes.first().copied() == Some(VERSION_FRAME_TYPE) {
+            if let Ok(mut g) = self.last.lock() {
+                *g = Some(bytes.to_vec());
+            }
         }
         // info 级：发出去的每一帧都可见（排查手机收不到/收错时看这里）
         log::info!(
             "bluetooth: [tx->app] send {} bytes: {:02x?}",
             bytes.len(),
             bytes
+        );
+        // 字符形式：文本类帧（回执 / 失败文本）可直接读出内容
+        log::info!(
+            "bluetooth: [tx->app] text: \"{}\"",
+            bytes_to_text(bytes)
         );
         let tx = self
             .outbound_tx
@@ -151,6 +188,10 @@ impl BleLink for GattBleLink {
             log::debug!("bluetooth: notify not delivered ({e}) — app not subscribed yet");
         }
         Ok(())
+    }
+
+    fn take_new_session(&self) -> bool {
+        self.new_session.swap(false, Ordering::SeqCst)
     }
 
     fn try_recv(&self) -> Result<Option<Vec<u8>>, BleLinkError> {
@@ -172,10 +213,15 @@ async fn serve_loop(
     inbound_tx: Arc<Mutex<mpsc::Sender<Vec<u8>>>>,
     outbound_tx: Arc<Mutex<broadcast::Sender<Vec<u8>>>>,
     last: Arc<Mutex<Option<Vec<u8>>>>,
+    new_session: Arc<AtomicBool>,
 ) {
     let mut backoff = Duration::from_secs(1);
     loop {
-        match serve(adapter, advertise, local_name, &inbound_tx, &outbound_tx, &last).await {
+        match serve(
+            adapter, advertise, local_name, &inbound_tx, &outbound_tx, &last, &new_session,
+        )
+        .await
+        {
             Ok(()) => return,
             Err(e) => {
                 log::warn!(
@@ -202,6 +248,7 @@ async fn serve(
     inbound_tx: &Arc<Mutex<mpsc::Sender<Vec<u8>>>>,
     outbound_tx: &Arc<Mutex<broadcast::Sender<Vec<u8>>>>,
     last: &Arc<Mutex<Option<Vec<u8>>>>,
+    new_session: &Arc<AtomicBool>,
 ) -> bluer::Result<()> {
     let session = Session::new().await?;
     log::info!("bluetooth: bluer session established (D-Bus org.bluez)");
@@ -263,6 +310,7 @@ async fn serve(
     let char2_tx = outbound_tx.clone();
     let char2_last = last.clone();
     let char2_read_last = last.clone();
+    let char2_new_session = new_session.clone();
 
     let app = Application {
         services: vec![Service {
@@ -318,10 +366,14 @@ async fn serve(
                         method: CharacteristicNotifyMethod::Fun(Box::new(move |mut notifier| {
                             let tx = char2_tx.clone();
                             let last_frame = char2_last.clone();
+                            let new_session = char2_new_session.clone();
                             async move {
                                 // notify 会话是长驻的，放到独立任务里跑，避免阻塞 StartNotify 返回
                                 tokio::spawn(async move {
-                                    notify_session(&mut notifier, &tx, &last_frame).await;
+                                    notify_session(
+                                        &mut notifier, &tx, &last_frame, &new_session,
+                                    )
+                                    .await;
                                 });
                             }
                             .boxed()
@@ -349,11 +401,15 @@ async fn notify_session(
     notifier: &mut bluer::gatt::local::CharacteristicNotifier,
     tx: &Arc<Mutex<broadcast::Sender<Vec<u8>>>>,
     last: &Arc<Mutex<Option<Vec<u8>>>>,
+    new_session: &Arc<AtomicBool>,
 ) {
     log::info!(
         "bluetooth: APP enabled notify (confirming={})",
         notifier.confirming()
     );
+    // 标记新会话：worker 据此后按 §2「重连清零」重置发送 sequence，
+    // 避免序号延续上次会话的累计值（APP 会判定为跳跃而报错）。
+    new_session.store(true, Ordering::SeqCst);
 
     let mut rx = match tx.lock() {
         Ok(tx) => tx.subscribe(),

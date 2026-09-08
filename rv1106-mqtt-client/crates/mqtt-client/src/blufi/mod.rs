@@ -78,7 +78,7 @@ pub struct BluFiConfig {
     pub wpa_iface: String,
     #[serde(default = "default_wpa_ctrl")]
     pub wpa_ctrl: String,
-    /// wpa_supplicant 配置文件路径，配网后将 SSID/密码写入此处（默认 /etc/wpa_supplicant.conf）。
+    /// wpa_supplicant 配置文件路径，配网后将 SSID/密码写入此处（默认 /data/wpa_supplicant.conf）。
     #[serde(default = "default_wpa_conf")]
     pub wpa_conf: String,
     #[serde(default = "default_ack_repeat")]
@@ -162,7 +162,7 @@ fn default_dbus_to() -> u64 {
     5000
 }
 fn default_scan_to() -> u64 {
-    8000
+    5000
 }
 fn default_conn_to() -> u64 {
     30000
@@ -174,7 +174,8 @@ fn default_wpa_ctrl() -> String {
     "/var/run/wpa_supplicant/wlan0".into()
 }
 fn default_wpa_conf() -> String {
-    "/etc/wpa_supplicant.conf".into()
+    // 设备实际使用的配置目录是 /data（/etc 下并非 wpa_supplicant 生效的配置）
+    "/data/wpa_supplicant.conf".into()
 }
 fn default_ack_repeat() -> u8 {
     3
@@ -254,6 +255,12 @@ pub trait BleLink: Send {
     fn send(&self, bytes: &[u8]) -> Result<(), BleLinkError>;
     /// 非阻塞取一条 APP 写入的字节流；无数据返回 Ok(None)。
     fn try_recv(&self) -> Result<Option<Vec<u8>>, BleLinkError>;
+    /// 对端是否开始了一次新的 notify 会话（APP 重连）。是则设备侧应按 §2
+    ///「重连清零」重置发送 sequence，避免序号延续上一次会话的累计值。
+    /// 取走即清除（一次性语义）。默认 false：无重连语义的链路（单测/桩）。
+    fn take_new_session(&self) -> bool {
+        false
+    }
 }
 
 /// 无真实 BLE 时的占位链接（仅供单测 / 阶段 4 前的逻辑验证）。
@@ -321,6 +328,11 @@ impl BluFiWorker {
     }
 }
 
+/// 重连（新 notify 会话）后发送 sequence 的起始值。
+/// 会话首帧是版本帧（seq=0，由 gatt 在 APP 订阅时补发），故清零后从 1 继续，
+/// 使重连后第一个响应帧为 seq=1，与 APP 期望一致（§2「重连清零」）。
+const SEQ_AFTER_VERSION: u8 = 1;
+
 struct WorkerCtx {
     cfg: BluFiConfig,
     #[allow(dead_code)]
@@ -370,6 +382,8 @@ impl WorkerCtx {
         self.send_frame(PKG_DATA, ftype::VERSION, fc::DIRECTION, &ver);
 
         loop {
+            // APP 重连（新 notify 会话）：按 §2 重置发送 sequence（见 handle_new_session）
+            self.handle_new_session();
             // 命令通道（20ms 轮询，兼顾 APP 写入的及时性）
             match self.cmd_rx.recv_timeout(Duration::from_millis(20)) {
                 Ok(BlufiCmd::StopConfig) => {
@@ -389,25 +403,70 @@ impl WorkerCtx {
         }
     }
 
+    /// APP 重连（新 notify 会话）：按 §2「重连清零」重置发送 sequence 与接收重组状态。
+    /// 否则 seq 会延续上次会话的累计值（如 5），而 APP 在版本帧(0) 之后期望下一个是 1，
+    /// 跳跃的序号会被判定为丢帧/重放而报错。
+    fn handle_new_session(&mut self) {
+        if self.link.take_new_session() {
+            self.seq_out = SEQ_AFTER_VERSION;
+            self.asm = FragmentAssembler::new();
+            log::info!(
+                "blufi: app reconnected — reset tx sequence to {} (§2 重连清零)",
+                SEQ_AFTER_VERSION
+            );
+        }
+    }
+
     fn next_seq(&mut self) -> u8 {
         let s = self.seq_out;
         self.seq_out = self.seq_out.wrapping_add(1);
         s
     }
 
-    /// 发送单帧（不分片）。
+    /// 发送单帧（不分片），sequence 自增。
     fn send_frame(&mut self, pkg_type: u8, subtype: u8, frame_ctrl: u8, data: &[u8]) {
-        let f = BluFiFrame::new(pkg_type, subtype, frame_ctrl, self.next_seq(), data.to_vec());
+        let seq = self.next_seq();
+        self.send_frame_seq(pkg_type, subtype, frame_ctrl, data, seq);
+    }
+
+    /// 发送单帧（不分片），使用指定 sequence（不递增）。
+    /// 重传同一条消息时必须复用同一 seq，否则对端会把重复帧当成 N 条不同的新消息。
+    fn send_frame_seq(
+        &mut self,
+        pkg_type: u8,
+        subtype: u8,
+        frame_ctrl: u8,
+        data: &[u8],
+        seq: u8,
+    ) {
+        let f = BluFiFrame::new(pkg_type, subtype, frame_ctrl, seq, data.to_vec());
         debug_tx(&f);
         if let Err(e) = self.link.send(&f.encode()) {
             log::warn!("blufi send failed: {e}");
         }
     }
 
-    /// 发送一段逻辑 data（自动按 514 字节分片；首片带 FRAGMENTED）。
+    /// 连发 N 帧同一内容（配网回执 / 失败文本）：
+    /// - **N 帧复用同一个 sequence**：这是同一条消息的冗余重传，不是 N 条消息；
+    ///   每帧各占一个 seq 会被对端当作独立消息（表现为 seq 2,3,4 而非 2,2,2）。
+    /// - 间隔 `ack_interval_ms`；**最后一帧之后不再等待**，避免白白拖慢后续配网流程。
+    fn send_repeat(&mut self, subtype: u8, data: &[u8]) {
+        let repeat = self.cfg.ack_repeat.max(1);
+        let interval = Duration::from_millis(self.cfg.ack_interval_ms);
+        let seq = self.next_seq();
+        for i in 0..repeat {
+            self.send_frame_seq(PKG_DATA, subtype, fc::DIRECTION, data, seq);
+            if i + 1 < repeat {
+                thread::sleep(interval);
+            }
+        }
+    }
+
+    /// 发送一段逻辑 data（自动按 255 字节分片；首片带 FRAGMENTED）。
+    /// 255 = BluFi 帧 data_len(u8)上限，超过须分片，否则长度字段截断、APP 解码错位。
     fn send_data(&mut self, pkg_type: u8, subtype: u8, data: &[u8]) {
         let base = self.seq_out;
-        let frames = split_for_tx(pkg_type, subtype, fc::DIRECTION, base, data, 514);
+        let frames = split_for_tx(pkg_type, subtype, fc::DIRECTION, base, data, 255);
         for f in &frames {
             debug_tx(f);
             if let Err(e) = self.link.send(&f.encode()) {
@@ -466,8 +525,23 @@ impl WorkerCtx {
             ftype::GET_WIFI_LIST => {
                 self.state = BluFiState::Scanning;
                 match self.wifi.scan() {
-                    Ok(items) => {
-                        let data = encode_scan_list(&items);
+                    Ok(mut items) => {
+                        // 按 RSSI 降序（i8 数值越大=信号越强），使单帧截断时保留最强热点。
+                        // 当前对端 APP 不支持 BluFi 分片（收到 FRAGMENTED 帧会 StopNotify 断开），
+                        // 而 BluFi 帧 data_len 为 u8（≤255）无法单帧承载大列表，故把列表压进单帧：
+                        // 编码上限 255，超出则丢弃最弱热点（已排序，前缀即最强）。
+                        // APP 支持分片后，改回 encode_scan_list(&items) 全量即可，send_data
+                        // 会自动按 255 切片（每片 data ≤ 255，data_len 字段不截断）。
+                        items.sort_by(|a, b| b.rssi.cmp(&a.rssi));
+                        let full_len = encode_scan_list(&items).len();
+                        let data = encode_scan_list_fitting(&items, 255);
+                        if data.len() < full_len {
+                            log::warn!(
+                                "blufi: scan list {} items ({}B) exceeds single-frame limit 255B; \
+                                 truncated to {}B (dropped weakest) — app lacks BluFi fragment support",
+                                items.len(), full_len, data.len()
+                            );
+                        }
                         self.send_data(PKG_DATA, ftype::WIFI_LIST, &data);
                     }
                     Err(e) => {
@@ -490,37 +564,62 @@ impl WorkerCtx {
             ftype::CUSTOM_DATA => {
                 match parse_provisioning(payload) {
                     Ok(prov) => {
-                        // B2：回执 ×N（间隔 ack_interval_ms）
-                        for _ in 0..self.cfg.ack_repeat {
-                            self.send_frame(PKG_DATA, ftype::CUSTOM_DATA, fc::DIRECTION, RECEIVED_MSG);
-                            thread::sleep(Duration::from_millis(self.cfg.ack_interval_ms));
-                        }
+                        // 按需求打印明文密码（含敏感信息，日志外发前请脱敏）
+                        log::info!(
+                            "blufi: provisioning request ssid={} pwd={} ip={:?} port={:?}",
+                            prov.ssid, prov.pwd, prov.ip, prov.port
+                        );
+                        // B2：回执 ×N（同一 sequence，间隔 ack_interval_ms）
+                        log::info!(
+                            "blufi: → app 回执 ×{}: \"{}\"",
+                            self.cfg.ack_repeat.max(1),
+                            String::from_utf8_lossy(RECEIVED_MSG)
+                        );
+                        self.send_repeat(ftype::CUSTOM_DATA, RECEIVED_MSG);
                         self.state = BluFiState::Connecting;
                         let pwd = if prov.pwd.is_empty() {
                             None
                         } else {
                             Some(prov.pwd.as_str())
                         };
-                        match self.wifi.connect(&prov.ssid, pwd) {
-                            Ok(_) => {
-                                let st = encode_connect_state(&prov.ssid);
+                        let result = self.wifi.connect(&prov.ssid, pwd);
+                        // 配网结束：把配置文件（含路径）打出来便于排查；psk 明文已打码
+                        log::info!(
+                            "blufi: 配置文件 {} 内容:\n{}",
+                            self.wifi.conf_path(),
+                            self.wifi.dump_conf()
+                        );
+                        match result {
+                            Ok(bssid) => {
+                                // 0xF 仅 2 字节 [opmode=STA, state=已连有IP]（对齐 ESP32 参考实现）
+                                let st = encode_connect_state(0x00);
+                                log::info!(
+                                    "blufi: → app 0xF 状态报告 data={:02x?} (opmode=STA, state=已连有IP)",
+                                    st
+                                );
                                 self.send_data(PKG_DATA, ftype::CONNECT_STATE, &st);
+                                log::info!(
+                                    "blufi: provisioning SUCCESS ssid={} bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} — 已回 0xF(2B, state=已连有IP)",
+                                    prov.ssid, bssid[0], bssid[1], bssid[2], bssid[3], bssid[4],
+                                    bssid[5]
+                                );
                                 let _ = self.event_tx.send(BlufiEvent::WifiConnected {
                                     ssid: prov.ssid.clone(),
                                 });
                                 self.state = BluFiState::Finish;
                             }
                             Err(e) => {
-                                log::warn!("blufi wifi connect failed: {e}");
-                                for _ in 0..self.cfg.ack_repeat {
-                                    self.send_frame(
-                                        PKG_DATA,
-                                        ftype::CUSTOM_DATA,
-                                        fc::DIRECTION,
-                                        FAILED_MSG,
-                                    );
-                                    thread::sleep(Duration::from_millis(self.cfg.ack_interval_ms));
-                                }
+                                log::warn!(
+                                    "blufi: provisioning FAILED ssid={} reason={} — 回 \"Wifi connection failed\" ×{}",
+                                    prov.ssid, e, self.cfg.ack_repeat.max(1)
+                                );
+                                log::warn!(
+                                    "blufi: → app 失败文本 ×{}: \"{}\"",
+                                    self.cfg.ack_repeat.max(1),
+                                    String::from_utf8_lossy(FAILED_MSG)
+                                );
+                                // 失败文本 ×N（同一 sequence）
+                                self.send_repeat(ftype::CUSTOM_DATA, FAILED_MSG);
                                 let _ = self.event_tx.send(BlufiEvent::WifiFailed {
                                     reason: e.to_string(),
                                 });
@@ -543,7 +642,9 @@ impl WorkerCtx {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
 
     /// 用 StubBleLink 模拟 APP 下发一帧配网，验证 worker 走通「回执 → 连接状态」路径。
     #[test]
@@ -568,6 +669,113 @@ mod tests {
         assert!(matches!(ev, BlufiEvent::EnterConfigMode));
         // 注意：因 StubBleLink 不真正执行 wpa_cli（无网络），connect 会失败，
         // 本测试仅验证帧处理不 panic、事件通道可用。
+    }
+
+    /// APP 重连后，设备发送 sequence 应按 §2「重连清零」重置：
+    /// 版本帧（会话首帧 seq=0）之后，重连后第一个响应帧必须是 seq=1，
+    /// 否则 APP 会把它当序号跳跃（丢帧/重放）而报错。
+    #[test]
+    fn reconnect_resets_tx_sequence() {
+        struct ReconnectLink {
+            sent: Arc<Mutex<Vec<Vec<u8>>>>,
+            new_session: Arc<AtomicBool>,
+        }
+        impl BleLink for ReconnectLink {
+            fn send(&self, bytes: &[u8]) -> Result<(), BleLinkError> {
+                self.sent.lock().unwrap().push(bytes.to_vec());
+                Ok(())
+            }
+            fn try_recv(&self) -> Result<Option<Vec<u8>>, BleLinkError> {
+                Ok(None)
+            }
+            fn take_new_session(&self) -> bool {
+                self.new_session.swap(false, Ordering::SeqCst)
+            }
+        }
+
+        let cfg = BluFiConfig::default();
+        let wifi = WifiManager::new(&cfg);
+        let (_cmd_tx, cmd_rx) = mpsc::channel::<BlufiCmd>();
+        let (ev_tx, _ev_rx) = mpsc::channel::<BlufiEvent>();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let flag = Arc::new(AtomicBool::new(false));
+
+        let mut ctx = WorkerCtx {
+            cfg,
+            device_id: "Gtest".into(),
+            cmd_rx,
+            event_tx: ev_tx,
+            link: Box::new(ReconnectLink {
+                sent: sent.clone(),
+                new_session: flag.clone(),
+            }),
+            asm: FragmentAssembler::new(),
+            seq_out: 5, // 模拟重连前已累计发出多帧
+            state: BluFiState::WaitApp,
+            wifi,
+        };
+
+        // 未重连：seq 延续 5
+        ctx.handle_new_session();
+        assert_eq!(ctx.seq_out, 5);
+
+        // 标记新会话（APP 重连）后清零到版本帧之后的 1
+        flag.store(true, Ordering::SeqCst);
+        ctx.handle_new_session();
+        assert_eq!(ctx.seq_out, SEQ_AFTER_VERSION);
+
+        // 实际发出的一帧，帧内 sequence 字段（第 3 字节）应为 1
+        ctx.send_frame(PKG_DATA, ftype::CUSTOM_DATA, fc::DIRECTION, b"x");
+        let sent = sent.lock().unwrap();
+        let frame = sent.last().expect("应发出一帧");
+        assert_eq!(frame[2], 1, "重连后第一帧 seq 应为 1，实际 {}", frame[2]);
+    }
+
+    /// 连发 N 帧（回执 / 失败文本）应**复用同一个 sequence**：
+    /// 这是同一条消息的冗余重传，不是 N 条消息，seq 只能自增 1。
+    #[test]
+    fn repeat_frames_share_one_sequence() {
+        struct RecLink {
+            sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        }
+        impl BleLink for RecLink {
+            fn send(&self, bytes: &[u8]) -> Result<(), BleLinkError> {
+                self.sent.lock().unwrap().push(bytes.to_vec());
+                Ok(())
+            }
+            fn try_recv(&self) -> Result<Option<Vec<u8>>, BleLinkError> {
+                Ok(None)
+            }
+        }
+
+        let mut cfg = BluFiConfig::default();
+        cfg.ack_repeat = 3;
+        cfg.ack_interval_ms = 0; // 测试不等待
+        let wifi = WifiManager::new(&cfg);
+        let (_cmd_tx, cmd_rx) = mpsc::channel::<BlufiCmd>();
+        let (ev_tx, _ev_rx) = mpsc::channel::<BlufiEvent>();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+
+        let mut ctx = WorkerCtx {
+            cfg,
+            device_id: "Gtest".into(),
+            cmd_rx,
+            event_tx: ev_tx,
+            link: Box::new(RecLink { sent: sent.clone() }),
+            asm: FragmentAssembler::new(),
+            seq_out: 5,
+            state: BluFiState::WaitApp,
+            wifi,
+        };
+
+        ctx.send_repeat(ftype::CUSTOM_DATA, RECEIVED_MSG);
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 3, "应连发 3 帧");
+        for f in sent.iter() {
+            assert_eq!(f[2], 5, "重传帧必须复用同一 seq，实际 {}", f[2]);
+        }
+        assert_eq!(ctx.seq_out, 6, "重传 N 帧只应让 seq 自增 1");
     }
 
     #[test]
