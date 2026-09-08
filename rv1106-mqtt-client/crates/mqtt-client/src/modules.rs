@@ -121,8 +121,8 @@ impl AppModule {
         }
     }
 
-    fn enqueue(&mut self, priority: u8, payload: Vec<u8>) {
-        self.fifo.push(FifoItem { priority, payload });
+    fn enqueue(&mut self, payload: Vec<u8>) {
+        self.fifo.push(FifoItem { payload });
         self.force_publish = true;
     }
 
@@ -172,24 +172,24 @@ impl AppModule {
                     self.state.lock().unwrap().moonraker_connected = false;
                 }
                 Event::GcodeResult { cmd_type, result } => {
-                    self.enqueue(0, UplinkMsg::gcode_reply(&self.cfg.device.id, &cmd_type, &result, now));
+                    self.enqueue( UplinkMsg::gcode_reply(&self.cfg.device.id, &cmd_type, &result, now));
                 }
                 Event::DownloadFinished { file_type, file_name, err_code } => {
                     let st = if err_code == 0 { "OK" } else { "ERROR" };
-                    self.enqueue(0, UplinkMsg::download_report(&self.cfg.device.id, "download_end", &file_name, file_type, st, err_code, now));
+                    self.enqueue( UplinkMsg::download_report(&self.cfg.device.id, "download_end", &file_name, file_type, st, err_code, now));
                 }
                 Event::FileListResult { files } => {
                     let total = files.len();
                     if total == 0 {
-                        self.enqueue(0, UplinkMsg::file_list_reply(&self.cfg.device.id, 0, 0, &[], now));
+                        self.enqueue( UplinkMsg::file_list_reply(&self.cfg.device.id, 0, 0, &[], now));
                     } else {
                         for (i, chunk) in files.chunks(10).enumerate() {
-                            self.enqueue(0, UplinkMsg::file_list_reply(&self.cfg.device.id, total, i, chunk, now));
+                            self.enqueue( UplinkMsg::file_list_reply(&self.cfg.device.id, total, i, chunk, now));
                         }
                     }
                 }
                 Event::Alarm { err_type, err_msg } => {
-                    self.enqueue(0, UplinkMsg::alarm(&self.cfg.device.id, err_type, &err_msg, now));
+                    self.enqueue( UplinkMsg::alarm(&self.cfg.device.id, err_type, &err_msg, now));
                 }
             }
         }
@@ -448,7 +448,7 @@ mod tests {
         m.handle_downlink(&DownlinkMsg::parse(br#"{"type":"login","bindState":1}"#).unwrap());
         assert!(!m.conn.bound);
         // 入队一个业务包，并触发周期上报时间点
-        m.enqueue(0, b"{\"type\":\"alarm\"}".to_vec());
+        m.enqueue(b"{\"type\":\"alarm\"}".to_vec());
         m.conn.last_status_publish_ts = 0;
 
         let mut outbox = Recorder::default();

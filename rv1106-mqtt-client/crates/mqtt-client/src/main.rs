@@ -143,8 +143,11 @@ async fn mqtt_main(
     client_id: &'static str,
     ch: &'static PublisherChannel,
 ) {
+    // LWT topic 在重连循环外计算一次（仅 `Box::leak` 一次）。若放进 run_session，
+    // 每次重连（失败 5s 一次）都会泄漏一个 String，长期运行内存只增不减。
+    let lwt_topic: &'static str = Box::leak(cfg.lwt_topic().into_boxed_str());
     loop {
-        let res = run_session(&cfg, &app_state, &event_rx, &cmd_tx, client_id, ch).await;
+        let res = run_session(&cfg, &app_state, &event_rx, &cmd_tx, client_id, ch, lwt_topic).await;
         log::warn!("mqtt session ended: {res:?}; reconnect in 5s");
         // 重连等待：block_on 单线程模型下，直接同步 sleep 即可（等价于异步定时器延时）。
         // 注：embassy-time 的 Timer 需要 embassy executor 提供定时器队列驱动，
@@ -160,6 +163,7 @@ async fn run_session(
     cmd_tx: &mpsc::Sender<DownlinkCmd>,
     client_id: &'static str,
     ch: &'static PublisherChannel,
+    lwt_topic: &'static str,
 ) -> Result<(), String> {
     let addr = cfg.broker_addr().map_err(|e| e.to_string())?;
 
@@ -175,8 +179,7 @@ async fn run_session(
     // 与 topic 中的设备标识一致）——即「和 id 一样是动态的」，每台设备自动用自身序列号作为 MQTT 用户名。
     let username = cfg.mqtt.username.as_deref().unwrap_or(&cfg.device.id);
     options = options.with_credentials(username, cfg.mqtt.password.as_deref().unwrap_or(""));
-    // LWT：断线遗嘱（MXS 协议 topic）
-    let lwt_topic: &'static str = Box::leak(cfg.lwt_topic().into_boxed_str());
+    // LWT：断线遗嘱（MXS 协议 topic）。lwt_topic 由调用方在重连循环外泄漏一次，避免每 5s 重复泄漏。
     static LWT_PAYLOAD: &[u8] = b"";
     options = options.with_last_will(LastWill { topic: lwt_topic, payload: LWT_PAYLOAD, qos: QoS::AtLeastOnce, retain: false });
 

@@ -316,7 +316,12 @@ impl MoonrakerWorker {
     }
 
     fn after_connect(&mut self) {
-        // 订阅对象（id=0，响应不关联）
+        // 订阅对象状态：fire-and-forget（id=0，响应不参与关联；handle_frame 在 pending
+        // 中查不到 0 会直接丢弃，这是预期的）。Moonraker 收到即生效，且首条
+        // notify_status_update 会立即回带订阅对象的全量状态。
+        //
+        // 因此不再单独发一次 id=0 的 `printer.objects.query` 全量查询：其响应同样因
+        // pending 无 0 被静默丢弃，纯属无效请求（旧注释「补齐订阅通知外的状态」是谎言）。
         let sub = RpcRequest {
             id: 0,
             jsonrpc: "2.0",
@@ -324,16 +329,6 @@ impl MoonrakerWorker {
             params: json!({ "objects": SUBSCRIBE_OBJECTS }),
         };
         if let Ok(t) = serde_json::to_string(&sub) {
-            let _ = self.client.send_text(&t);
-        }
-        // 主动全量查询一次（补齐订阅通知外的状态）
-        let q = RpcRequest {
-            id: 0,
-            jsonrpc: "2.0",
-            method: "printer.objects.query".into(),
-            params: json!({ "objects": SUBSCRIBE_OBJECTS }),
-        };
-        if let Ok(t) = serde_json::to_string(&q) {
             let _ = self.client.send_text(&t);
         }
         self.state.lock().unwrap().moonraker_connected = true;

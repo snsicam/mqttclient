@@ -130,11 +130,13 @@ impl ConnStateMachine {
 
 #[derive(Debug, Clone)]
 pub struct FifoItem {
-    pub priority: u8, // 0 最高
     pub payload: Vec<u8>,
 }
 
-/// 上行出队 FIFO（LLD-003 §7.5：容量 10；满时淘汰最低优先级）。
+/// 上行出队 FIFO（LLD-003 §7.5：容量 10）。
+///
+/// 早期实现带「优先级淘汰」逻辑，但所有入队调用（`modules.rs` 的 `enqueue`）优先级恒为 0，
+/// 该逻辑从未生效，故简化为普通有界 FIFO：未满追加、已满丢弃新项、出队按先入先出。
 pub struct UplinkFifo {
     items: std::collections::VecDeque<FifoItem>,
     capacity: usize,
@@ -148,35 +150,16 @@ impl UplinkFifo {
     pub fn len(&self) -> usize { self.items.len() }
     pub fn is_empty(&self) -> bool { self.items.is_empty() }
 
+    /// 入队：未满则追加；已满则丢弃新项（保持先入先出语义）。
     pub fn push(&mut self, item: FifoItem) {
         if self.items.len() < self.capacity {
             self.items.push_back(item);
-            return;
-        }
-        // 满：找到最低优先级（数值最大），替换之；若新项优先级更低则丢弃新项。
-        let mut min_idx = 0usize;
-        for (i, it) in self.items.iter().enumerate() {
-            if it.priority > self.items[min_idx].priority {
-                min_idx = i;
-            }
-        }
-        if item.priority < self.items[min_idx].priority {
-            self.items[min_idx] = item;
         }
     }
 
-    /// 出队：优先最高优先级（数值最小），同优先级 FIFO。
+    /// 出队：优先最早入队者（FIFO）。
     pub fn pop(&mut self) -> Option<FifoItem> {
-        if self.items.is_empty() {
-            return None;
-        }
-        let mut idx = 0usize;
-        for i in 1..self.items.len() {
-            if self.items[i].priority < self.items[idx].priority {
-                idx = i;
-            }
-        }
-        self.items.remove(idx)
+        self.items.pop_front()
     }
 }
 
@@ -216,15 +199,15 @@ mod tests {
     #[test]
     fn fifo_capacity_and_priority() {
         let mut f = UplinkFifo::new(3);
-        f.push(FifoItem { priority: 5, payload: b"low".to_vec() });
-        f.push(FifoItem { priority: 0, payload: b"high".to_vec() });
-        f.push(FifoItem { priority: 3, payload: b"mid".to_vec() });
+        f.push(FifoItem { payload: b"low".to_vec() });
+        f.push(FifoItem { payload: b"high".to_vec() });
+        f.push(FifoItem { payload: b"mid".to_vec() });
         assert_eq!(f.len(), 3);
-        // 满时推入优先级 1：替换最低优先级 5
-        f.push(FifoItem { priority: 1, payload: b"new".to_vec() });
+        // 满时推入新项：丢弃新项（有界 FIFO）
+        f.push(FifoItem { payload: b"new".to_vec() });
         assert_eq!(f.len(), 3);
+        assert_eq!(f.pop().unwrap().payload, b"low".to_vec());
         assert_eq!(f.pop().unwrap().payload, b"high".to_vec());
-        assert_eq!(f.pop().unwrap().payload, b"new".to_vec());
         assert_eq!(f.pop().unwrap().payload, b"mid".to_vec());
         assert!(f.pop().is_none());
     }
@@ -232,8 +215,8 @@ mod tests {
     #[test]
     fn fifo_drop_lower_priority_new() {
         let mut f = UplinkFifo::new(1);
-        f.push(FifoItem { priority: 0, payload: b"a".to_vec() });
-        f.push(FifoItem { priority: 9, payload: b"b".to_vec() }); // 更低优先级，丢弃
+        f.push(FifoItem { payload: b"a".to_vec() });
+        f.push(FifoItem { payload: b"b".to_vec() }); // 满，丢弃新项
         assert_eq!(f.len(), 1);
         assert_eq!(f.pop().unwrap().payload, b"a".to_vec());
     }

@@ -317,10 +317,8 @@ impl BluFiWorker {
     }
 }
 
-/// 重连（新 notify 会话）后发送 sequence 的起始值。
-/// 会话首帧是版本帧（seq=0，由 gatt 在 APP 订阅时补发），故清零后从 1 继续，
-/// 使重连后第一个响应帧为 seq=1，与 APP 期望一致（§2「重连清零」）。
-const SEQ_AFTER_VERSION: u8 = 1;
+// 重连后发送 sequence 的「归位值 = 1」由 `handle_new_session` 直接体现（见该函数），
+// 不再用独立魔数常量（原 `SEQ_AFTER_VERSION` 已随版本帧补发一并收拢进 worker）。
 
 struct WorkerCtx {
     cfg: BluFiConfig,
@@ -392,17 +390,22 @@ impl WorkerCtx {
         }
     }
 
-    /// APP 重连（新 notify 会话）：按 §2「重连清零」重置发送 sequence 与接收重组状态。
+    /// APP 重连（新 notify 会话）：按 §2「重连清零」重置发送 sequence 与接收重组状态，
+    /// 并补发版本帧（会话首帧 seq=0）。版本帧重发原本在 gatt 层另做一套（缓存字节 +
+    /// APP 订阅时补发），与这里的 seq 重置是同一个重连事件的两半；现统一收拢到此处，
+    /// 去掉跨文件的「版本帧重发 + 魔数 SEQ_AFTER_VERSION」两套机制。
     /// 否则 seq 会延续上次会话的累计值（如 5），而 APP 在版本帧(0) 之后期望下一个是 1，
     /// 跳跃的序号会被判定为丢帧/重放而报错。
     fn handle_new_session(&mut self) {
         if self.link.take_new_session() {
-            self.seq_out = SEQ_AFTER_VERSION;
+            self.seq_out = 0; // 重连清零：版本帧作为首帧 seq=0
             self.asm = FragmentAssembler::new();
-            log::debug!(
-                "blufi: app reconnected — reset tx sequence to {} (§2 重连清零)",
-                SEQ_AFTER_VERSION
-            );
+            // 重连后补发版本帧：APP 重连时常已错过启动时的版本帧；BlueZ 在 StartNotify
+            // 后需短暂就绪，稍等再发避免首帧被丢弃。
+            std::thread::sleep(Duration::from_millis(100));
+            let ver = encode_version(self.cfg.version_major, self.cfg.version_minor);
+            self.send_frame(PKG_DATA, ftype::VERSION, fc::DIRECTION, &ver);
+            log::debug!("blufi: app reconnected — reset tx sequence & resend version (§2 重连清零)");
         }
     }
 
@@ -721,16 +724,18 @@ mod tests {
         ctx.handle_new_session();
         assert_eq!(ctx.seq_out, 5);
 
-        // 标记新会话（APP 重连）后清零到版本帧之后的 1
+        // 标记新会话（APP 重连）：清零并补发版本帧（seq=0），seq_out 归位到 1
         flag.store(true, Ordering::SeqCst);
         ctx.handle_new_session();
-        assert_eq!(ctx.seq_out, SEQ_AFTER_VERSION);
+        assert_eq!(ctx.seq_out, 1, "重连后 seq_out 应归位到 1");
 
-        // 实际发出的一帧，帧内 sequence 字段（第 3 字节）应为 1
+        // 续发一帧，帧内 sequence 字段（第 3 字节）应为 1
         ctx.send_frame(PKG_DATA, ftype::CUSTOM_DATA, fc::DIRECTION, b"x");
         let sent = sent.lock().unwrap();
+        // 重连应先行补发版本帧（seq=0），再续发响应帧（seq=1）
+        assert_eq!(sent[0][2], 0, "重连应补发版本帧 seq=0");
         let frame = sent.last().expect("应发出一帧");
-        assert_eq!(frame[2], 1, "重连后第一帧 seq 应为 1，实际 {}", frame[2]);
+        assert_eq!(frame[2], 1, "重连后第一个响应帧 seq 应为 1，实际 {}", frame[2]);
     }
 
     /// 连发 N 帧（回执 / 失败文本）**sequence 必须递增**：

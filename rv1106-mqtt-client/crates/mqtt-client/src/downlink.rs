@@ -1,5 +1,6 @@
 //! 下行分发（LLD-003 §7.4）：AppModule on_message → Dispatcher（Moonraker 执行）→ 事件回传。
 
+use std::io::{Read, Write};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -46,8 +47,15 @@ impl Dispatcher {
     }
 
     fn run(&mut self) {
-        while let Ok(cmd) = self.cmd_rx.recv_timeout(Duration::from_millis(500)) {
-            self.handle(cmd);
+        // 收命令：500ms 超时仅作为「周期性唤醒」，不可作为退出条件——否则空闲 500ms 后
+        // 线程退出，后续 gcode/下载命令会因接收端已 drop 被静默丢弃（cmd_tx.send 返回 Err）。
+        // 仅在发送端（AppModule）彻底断开（Disconnected）时才退出。
+        loop {
+            match self.cmd_rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(cmd) => self.handle(cmd),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
         }
     }
 
@@ -143,6 +151,10 @@ impl Dispatcher {
     }
 
     /// HTTP 下载到 U 盘。err_code：0 成功 / 1 忙或网络错误 / 2 无 U盘或写失败 / 3 传输超时或超限。
+    ///
+    /// 流式写入磁盘：按 `download.chunk_size` 分块读取并边读边落盘，同时在读取过程中累加校验
+    /// 总量，超过 `max_file_bytes` 立即中止并删除残留文件。避免「先整文件读进内存再校验 512MB」
+    /// 导致大文件撑爆内存；也让配置项 `chunk_size` 真正生效。
     fn download(&mut self, file_type: u8, file_name: &str, url: Option<&str>, _server_ip: Option<&str>) -> u8 {
         let Some(url) = url.filter(|u| !u.is_empty()) else {
             return 1;
@@ -170,28 +182,53 @@ impl Dispatcher {
                 return 1;
             }
         };
-        let body = match resp.body_mut().read_to_vec() {
-            Ok(b) => b,
+
+        let max_bytes = self.cfg.download.max_file_bytes;
+        let mut reader = resp.body_mut().as_reader();
+        let mut buf = vec![0u8; self.cfg.download.chunk_size.max(1)];
+        let mut file = match std::fs::File::create(&dest) {
+            Ok(f) => f,
             Err(e) => {
-                log::warn!("download read: {e}");
-                return 3;
+                log::warn!("create {dest:?}: {e}");
+                return 2;
             }
         };
-        if body.len() as u64 > self.cfg.download.max_file_bytes {
-            log::warn!("download too large: {}", body.len());
-            return 3;
+        let mut total: u64 = 0;
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    log::warn!("download read {url}: {e}");
+                    let _ = std::fs::remove_file(&dest);
+                    return 3;
+                }
+            };
+            total += n as u64;
+            if total > max_bytes {
+                log::warn!("download too large: {total} > max {max_bytes}");
+                let _ = std::fs::remove_file(&dest);
+                return 3;
+            }
+            if let Err(e) = file.write_all(&buf[..n]) {
+                log::warn!("write {dest:?}: {e}");
+                let _ = std::fs::remove_file(&dest);
+                return 2;
+            }
         }
-        if let Err(e) = std::fs::write(&dest, &body) {
-            log::warn!("write {dest:?}: {e}");
+        if let Err(e) = file.flush() {
+            log::warn!("flush {dest:?}: {e}");
+            let _ = std::fs::remove_file(&dest);
             return 2;
         }
+
         // GCODE：上传到 Klipper 以支持打印（multipart 上传，简单实现）
         if file_type == 0 {
             if let Err(e) = self.mr.request("server.files.upload", json!({ "path": safe }), Duration::from_secs(10)) {
                 log::warn!("klipper upload skipped: {e}");
             }
         }
-        log::info!("download ok: {safe} ({} bytes)", body.len());
+        log::info!("download ok: {safe} ({total} bytes)");
         0
     }
 }

@@ -52,17 +52,15 @@ const CHAR1_UUID: Uuid = Uuid::from_u128(0x0000ff01_0000_1000_8000_00805f9b34fb)
 const CHAR2_UUID: Uuid = Uuid::from_u128(0x0000ff02_0000_1000_8000_00805f9b34fb);
 
 /// 版本帧 type 字节 = `PKG_DATA(0x01) | VERSION(0x10<<2)` = `0x41`。
-/// 仅此帧作为「APP 重连时补发」的缓存：扫描等分片（type `0x45`）不缓存，
-/// 否则重连会把上一次扫描的残留分片重发给新会话，导致 app 解析错乱。
+/// 仅此帧被缓存（供 0xFF02 读特征回读最近一帧）；扫描等分片（type `0x45`）不缓存，
+/// 否则读特征会回带上一次扫描的残留分片，导致 app 解析错乱。APP 重连时的版本帧补发
+/// 已收拢到 worker `handle_new_session`（与发送 sequence 重置统一处理），此处不再补发。
 const VERSION_FRAME_TYPE: u8 = type_byte(PKG_DATA, ftype::VERSION);
 
 /// 下行（设备 → APP）广播通道容量。APP 未订阅时不积压（send 直接返回无接收者）。
 const OUTBOUND_CAP: usize = 64;
 /// 注册失败后的重试退避上限。
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
-/// APP 使能 notify 后补发首帧前的延时：等 BlueZ 内部就绪，避免首帧丢失。
-const RESEND_DELAY: Duration = Duration::from_millis(100);
-
 /// 广播名硬上限（scan response 31 字节预算，2 字节 AD 头 → 名字 ≤ 29）。
 /// 仅作安全兜底；名字过长由 BlueZ 在 scan response 阶段处理（与 `bt_ble_up.sh` 一致）。
 const NAME_MAX: usize = 29;
@@ -159,10 +157,9 @@ pub struct GattBleLink {
 
 impl BleLink for GattBleLink {
     fn send(&self, bytes: &[u8]) -> Result<(), BleLinkError> {
-        // 仅「版本帧(0x41)」作为可重发帧缓存：APP 重连 enable notify 时补发它，
-        // 避免首帧（版本帧）在订阅前发出而丢失；其余帧（含 WIFI_LIST 分片、ACK、
-        // 回执、错误帧）不缓存，否则重连会把上一次扫描的残留分片重发给新会话，
-        // 导致 app 解析错乱、提示错误。
+        // 仅缓存「版本帧(0x41)」供 0xFF02 读特征回读最近一帧；其余帧（含 WIFI_LIST 分片、
+        // ACK、回执、错误帧）不缓存，否则读特征会回带上一次扫描的残留分片，导致 app 解析错乱。
+        // （APP 重连时的版本帧补发由 worker `handle_new_session` 统一处理，见 mod.rs。）
         if bytes.first().copied() == Some(VERSION_FRAME_TYPE) {
             if let Ok(mut g) = self.last.lock() {
                 *g = Some(bytes.to_vec());
@@ -309,7 +306,6 @@ async fn serve(
     let char1_tx = inbound_tx.clone();
     // char2（0xFF02）：worker 下发 → notify 给 APP；同时可读（协议文档：可读 + 可通知）
     let char2_tx = outbound_tx.clone();
-    let char2_last = last.clone();
     let char2_read_last = last.clone();
     let char2_new_session = new_session.clone();
 
@@ -366,13 +362,12 @@ async fn serve(
                         notify: true,
                         method: CharacteristicNotifyMethod::Fun(Box::new(move |mut notifier| {
                             let tx = char2_tx.clone();
-                            let last_frame = char2_last.clone();
                             let new_session = char2_new_session.clone();
                             async move {
                                 // notify 会话是长驻的，放到独立任务里跑，避免阻塞 StartNotify 返回
                                 tokio::spawn(async move {
                                     notify_session(
-                                        &mut notifier, &tx, &last_frame, &new_session,
+                                        &mut notifier, &tx, &new_session,
                                     )
                                     .await;
                                 });
@@ -397,11 +392,10 @@ async fn serve(
     Ok(())
 }
 
-/// 一次 notify 会话：先补发最近一帧（VERSION 帧常早于订阅发出），再转发后续帧。
+/// 一次 notify 会话：转发 worker 下发的帧（版本帧重连补发由 worker 统一处理）。
 async fn notify_session(
     notifier: &mut bluer::gatt::local::CharacteristicNotifier,
     tx: &Arc<Mutex<broadcast::Sender<Vec<u8>>>>,
-    last: &Arc<Mutex<Option<Vec<u8>>>>,
     new_session: &Arc<AtomicBool>,
 ) {
     log::info!(
@@ -419,19 +413,6 @@ async fn notify_session(
             return;
         }
     };
-
-    // BlueZ 在 StartNotify() 返回前可能尚未完成内部就绪，稍延迟再发首帧，避免丢帧。
-    tokio::time::sleep(RESEND_DELAY).await;
-    if let Some(data) = last.lock().ok().and_then(|g| g.clone()) {
-        log::debug!(
-            "bluetooth: [tx->app] resend last frame {} bytes: {:02x?}",
-            data.len(),
-            data
-        );
-        if let Err(e) = notifier.notify(data).await {
-            log::warn!("bluetooth: resend failed: {e}");
-        }
-    }
 
     loop {
         match rx.recv().await {
