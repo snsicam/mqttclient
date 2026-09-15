@@ -5,6 +5,7 @@
 //! - `moonraker`：Moonraker WS 客户端（JSON-RPC/通知分发/状态桥）
 //! - `protocol`：MXS 上行/下行 12 类包编解码
 //! - `state`：连接状态机 / 10 槽上行 FIFO / 事件
+//! - `uds`：UI 控制通道（Unix domain socket，klipper_screen 经此下发云侧操作）
 //! - `downlink`：下行分发器 + Marlin→Klipper 行为转换
 //! - `modules`：8 个业务模块聚合（AppModule，实现 myrtio-mqtt 的 MqttModule）
 //! - `app_state`：共享状态（温度/打印/调平/硬件）
@@ -21,6 +22,7 @@ pub mod moonraker;
 pub mod protocol;
 pub mod state;
 pub mod transport;
+pub mod uds;
 
 pub use app_state::AppState;
 pub use config::AppConfig;

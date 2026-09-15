@@ -12,10 +12,10 @@ use std::sync::{Arc, Mutex};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::Duration;
-use mqtt_client::downlink::{Dispatcher, DownlinkCmd};
+use mqtt_client::downlink::{Dispatcher, DownlinkCmd, UiCmd};
 use mqtt_client::modules::AppModule;
 use mqtt_client::moonraker::MoonrakerWorker;
-use mqtt_client::state::Event;
+use mqtt_client::state::{Event, SharedUiState};
 use mqtt_client::transport::StdTcpTransport;
 use mqtt_client::config::{device_id_from_serial, read_board_serial, PLACEHOLDER_DEVICE_ID};
 use mqtt_client::{AppConfig, AppState};
@@ -203,10 +203,15 @@ fn main() {
     let app_state = Arc::new(Mutex::new(AppState::default()));
     let (event_tx, event_rx) = mpsc::channel::<Event>();
     let (cmd_tx, cmd_rx) = mpsc::channel::<DownlinkCmd>();
+    let (ui_cmd_tx, ui_cmd_rx) = mpsc::channel::<UiCmd>();
+    let ui_state: SharedUiState = Arc::new(Mutex::new(Default::default()));
 
     // 独立线程：moonraker 状态服务 / 下行分发
     let mr = MoonrakerWorker::spawn(cfg.moonraker.clone(), app_state.clone(), event_tx.clone());
-    Dispatcher::spawn(cfg.clone(), cmd_rx, mr, event_tx);
+    Dispatcher::spawn(cfg.clone(), cmd_rx, ui_cmd_rx, mr, event_tx);
+
+    // UI 控制通道（UDS）：klipper_screen 经此下发云侧操作（下载 / 解绑 / 文件列表 / gcode）。
+    mqtt_client::uds::spawn(cfg.uds.clone(), ui_cmd_tx, ui_state.clone());
 
     let event_rx = Arc::new(Mutex::new(event_rx));
 
@@ -215,7 +220,7 @@ fn main() {
     let client_id: &'static str = Box::leak(cfg.device.id.clone().into_boxed_str());
     let ch: &'static Channel<CriticalSectionRawMutex, PublishRequest<'static>, 8> = Box::leak(Box::new(Channel::new()));
 
-    futures::executor::block_on(mqtt_main(cfg, app_state, event_rx, cmd_tx, client_id, ch));
+    futures::executor::block_on(mqtt_main(cfg, app_state, event_rx, cmd_tx, ui_state, client_id, ch));
 }
 
 type PublisherChannel = Channel<CriticalSectionRawMutex, PublishRequest<'static>, 8>;
@@ -225,6 +230,7 @@ async fn mqtt_main(
     app_state: Arc<Mutex<AppState>>,
     event_rx: Arc<Mutex<mpsc::Receiver<Event>>>,
     cmd_tx: mpsc::Sender<DownlinkCmd>,
+    ui_state: SharedUiState,
     client_id: &'static str,
     ch: &'static PublisherChannel,
 ) {
@@ -232,7 +238,7 @@ async fn mqtt_main(
     // 每次重连（失败 5s 一次）都会泄漏一个 String，长期运行内存只增不减。
     let lwt_topic: &'static str = Box::leak(cfg.lwt_topic().into_boxed_str());
     loop {
-        let res = run_session(&cfg, &app_state, &event_rx, &cmd_tx, client_id, ch, lwt_topic).await;
+        let res = run_session(&cfg, &app_state, &event_rx, &cmd_tx, &ui_state, client_id, ch, lwt_topic).await;
         log::warn!("mqtt session ended: {res:?}; reconnect in 5s");
         // 重连等待：block_on 单线程模型下，直接同步 sleep 即可（等价于异步定时器延时）。
         // 注：embassy-time 的 Timer 需要 embassy executor 提供定时器队列驱动，
@@ -246,6 +252,7 @@ async fn run_session(
     app_state: &Arc<Mutex<AppState>>,
     event_rx: &Arc<Mutex<mpsc::Receiver<Event>>>,
     cmd_tx: &mpsc::Sender<DownlinkCmd>,
+    ui_state: &SharedUiState,
     client_id: &'static str,
     ch: &'static PublisherChannel,
     lwt_topic: &'static str,
@@ -273,7 +280,7 @@ async fn run_session(
     // 发布通道（仅作 runtime 的 publisher 输入；业务发布走模块 outbox）
     let rx = ch.receiver();
 
-    let module = AppModule::new(cfg.clone(), app_state.clone(), event_rx.clone(), cmd_tx.clone());
+    let module = AppModule::new(cfg.clone(), app_state.clone(), event_rx.clone(), cmd_tx.clone(), ui_state.clone());
     let mut runtime = MqttRuntime::new(client, module, rx);
     runtime.run().await.map_err(|e| format!("runtime: {e:?}"))
 }

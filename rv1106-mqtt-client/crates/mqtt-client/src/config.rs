@@ -17,6 +17,9 @@ pub struct AppConfig {
     /// 蓝牙配网（BluFi）配置；段缺失时回退默认（详见 `BluFiConfig::default`）。
     #[serde(default)]
     pub blufi: BluFiConfig,
+    /// UI 控制通道（Unix domain socket）：klipper_screen 经此下发云侧操作（下载/解绑）。
+    #[serde(default)]
+    pub uds: UdsConfig,
 }
 
 impl Default for AppConfig {
@@ -27,6 +30,7 @@ impl Default for AppConfig {
             moonraker: MoonrakerConfig::default(),
             download: DownloadConfig::default(),
             blufi: BluFiConfig::default(),
+            uds: UdsConfig::default(),
         }
     }
 }
@@ -164,7 +168,7 @@ pub struct MoonrakerConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DownloadConfig {
-    /// U 盘挂载目录（GCODE/固件下载落地）。
+    /// Moonraker `gcodes` 受监控目录（GCODE 下载落地；须与 Moonraker `[file_manager] gcode_path` 一致；支持 ~ 展开）。
     #[serde(default = "default_dl_dir")]
     pub dir: String,
     /// 最大下载字节数。
@@ -199,15 +203,33 @@ impl Default for DownloadConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UdsConfig {
+    /// 是否启用 UI 控制通道（Unix domain socket）。
+    #[serde(default = "default_uds_enabled")]
+    pub enabled: bool,
+    /// 监听的 Unix socket 路径（klipper_screen 连接此路径）。
+    #[serde(default = "default_uds_socket")]
+    pub socket_path: String,
+}
+
+impl Default for UdsConfig {
+    fn default() -> Self {
+        Self { enabled: default_uds_enabled(), socket_path: default_uds_socket() }
+    }
+}
+
 fn default_lang() -> u8 { 0 }
 fn default_keepalive() -> u16 { 60 }
 /// 默认设备型号（未配置 `[mqtt] model` 时使用）。
 fn default_model() -> String { DEFAULT_MODEL.to_string() }
 fn default_mr_host() -> String { "127.0.0.1".into() }
 fn default_mr_port() -> u16 { 7125 }
-fn default_dl_dir() -> String { "/mnt/udisk".into() }
+fn default_dl_dir() -> String { "~/printer_data/gcodes/cloud".into() }
 fn default_max_file() -> u64 { 512 * 1024 * 1024 }
 fn default_chunk() -> usize { 64 * 1024 }
+fn default_uds_enabled() -> bool { true }
+fn default_uds_socket() -> String { "/run/mqtt-client/ui.sock".into() }
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -311,7 +333,7 @@ host = "127.0.0.1"
 port = 7125
 
 [download]
-dir = "/mnt/udisk"
+dir = "~/printer_data/gcodes/cloud"
 "#;
         let cfg: AppConfig = toml::from_str(text).expect("parse");
         assert_eq!(cfg.device.id, "G1234");
@@ -362,6 +384,7 @@ port = 7125
             moonraker: MoonrakerConfig::default(),
             download: DownloadConfig::default(),
             blufi: BluFiConfig::default(),
+            uds: UdsConfig::default(),
         };
         assert!(cfg.validate().is_err());
     }

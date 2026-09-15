@@ -1,5 +1,7 @@
 //! 连接状态机 / 10 槽上行 FIFO / 内部事件（LLD-003 §7.1/§7.5/§5）。
 
+use std::sync::{Arc, Mutex};
+
 // ---------------------------------------------------------------------------
 // 内部事件：Moonraker / dispatcher → AppModule
 // ---------------------------------------------------------------------------
@@ -15,13 +17,44 @@ pub enum Event {
     MrDisconnected,
     /// gcode 执行结果（cmdType 原样回传）。
     GcodeResult { cmd_type: String, result: String },
-    /// 文件下载完成（err_code: 0 成功/1 忙/2 无 U盘/3 传输超时）。
-    DownloadFinished { file_type: u8, file_name: String, err_code: u8 },
+    /// 文件下载开始（协议 §5.5：设备→服务器 `download_begin` 回复/上报）。
+    /// MQTT 路径由模块直接回包；UDS（UI 发起）路径经此事件触发 `download_begin` 上行。
+    DownloadStarted { file_type: u8, file_name: String },
+    /// 文件下载完成（err_code: 0 成功/1 忙/2 无目录或写失败/3 传输超限/4 不支持 file_type）。
+    /// `from_ui`：true = UDS（UI）触发，其忙标志由 UDS 线程自行清位，AppModule 不再清。
+    DownloadFinished { file_type: u8, file_name: String, err_code: u8, from_ui: bool },
     /// 文件列表查询结果。
     FileListResult { files: Vec<(String, u64)> },
     /// 硬件告警（errType 1~20）。
     Alarm { err_type: u8, err_msg: String },
+    /// UI 经 UDS 发起的设备解绑请求（触发 device_unbind 上行）。
+    UiUnbind,
 }
+
+// ---------------------------------------------------------------------------
+// UI 可见云端状态（klipper_screen 经 UDS bind_status 读取，AppModule 写入）
+// ---------------------------------------------------------------------------
+
+/// UI 关心的云连接/绑定状态镜像，由 AppModule 在连接/登录变化时更新。
+#[derive(Debug, Clone, Default)]
+pub struct UiState {
+    /// 已连上 MQTT Broker。
+    pub cloud_connected: bool,
+    /// Moonraker（Klippy）已连接。
+    pub moonraker_connected: bool,
+    /// 是否已绑定账号（bindState==0）。
+    pub bound: bool,
+    /// 最近一次 login 回复的 bindState（0=已绑定/1=未绑定/2=未录入）。
+    pub bind_state: u8,
+    /// 绑定的云端账号。
+    pub account: String,
+    /// 下载忙闲标志（AV-1）：任一入口（MQTT `download_begin` / UDS `download`）置位，
+    /// 完成后清位；用于拒绝并发/叠加下载（协议忙语义，err_code=1）。
+    pub downloading: bool,
+}
+
+/// 跨线程共享的 UI 状态（AppModule 写、UDS 服务读）。
+pub type SharedUiState = Arc<Mutex<UiState>>;
 
 // ---------------------------------------------------------------------------
 // 连接状态机

@@ -42,6 +42,12 @@ max_file_bytes = 536870912
 # 下载分块缓冲
 chunk_size = 65536
 
+[uds]
+# UI 控制通道（Unix domain socket）：klipper_screen 经此下发云侧操作（下载/解绑/文件列表/gcode）。
+enabled = true
+# 监听路径；父目录会被自动创建，启动时会清理残留 socket 文件。
+socket_path = "/run/mqtt-client/ui.sock"
+
 [blufi]
 # 蓝牙配网（BluFi）相关配置
 enabled = true

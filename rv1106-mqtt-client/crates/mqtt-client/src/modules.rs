@@ -17,7 +17,7 @@ use crate::app_state::AppState;
 use crate::config::AppConfig;
 use crate::downlink::DownlinkCmd;
 use crate::protocol::{self, DownlinkMsg, UplinkMsg};
-use crate::state::{ConnState, ConnStateMachine, Event, FifoItem, UplinkFifo};
+use crate::state::{ConnState, ConnStateMachine, Event, FifoItem, SharedUiState, UplinkFifo};
 
 const UPLINK_FIFO_CAP: usize = 10;
 const TICK_INTERVAL: Duration = Duration::from_millis(500);
@@ -96,10 +96,13 @@ pub struct AppModule {
     state: Arc<Mutex<AppState>>,
     event_rx: Arc<Mutex<mpsc::Receiver<Event>>>,
     cmd_tx: mpsc::Sender<DownlinkCmd>,
+    ui_state: SharedUiState,
     conn: ConnStateMachine,
     fifo: UplinkFifo,
     mods: BizModules,
     force_publish: bool,
+    /// 解绑上行绕过"未绑定不发布"守卫（见 Event::UiUnbind 处理）。
+    force_unbind_publish: bool,
 }
 
 impl AppModule {
@@ -108,16 +111,19 @@ impl AppModule {
         state: Arc<Mutex<AppState>>,
         event_rx: Arc<Mutex<mpsc::Receiver<Event>>>,
         cmd_tx: mpsc::Sender<DownlinkCmd>,
+        ui_state: SharedUiState,
     ) -> Self {
         Self {
             cfg,
             state,
             event_rx,
             cmd_tx,
+            ui_state,
             conn: ConnStateMachine::default(),
             fifo: UplinkFifo::new(UPLINK_FIFO_CAP),
             mods: BizModules::default(),
             force_publish: false,
+            force_unbind_publish: false,
         }
     }
 
@@ -167,16 +173,37 @@ impl AppModule {
                 }
                 Event::MrConnected => {
                     self.state.lock().unwrap().moonraker_connected = true;
+                    self.ui_state.lock().unwrap().moonraker_connected = true;
                 }
                 Event::MrDisconnected => {
                     self.state.lock().unwrap().moonraker_connected = false;
+                    self.ui_state.lock().unwrap().moonraker_connected = false;
                 }
                 Event::GcodeResult { cmd_type, result } => {
                     self.enqueue( UplinkMsg::gcode_reply(&self.cfg.device.id, &cmd_type, &result, now));
                 }
-                Event::DownloadFinished { file_type, file_name, err_code } => {
+                Event::DownloadStarted { file_type, file_name } => {
+                    // 协议 §5.5：设备→服务器 `download_begin`（受理 transState=OK / errCode=0）。
+                    self.enqueue( UplinkMsg::download_report(&self.cfg.device.id, "download_begin", &file_name, file_type, "OK", 0, now));
+                }
+                Event::DownloadFinished { file_type, file_name, err_code, from_ui } => {
+                    // 忙闲标志归属（AV-1）：MQTT 触发（from_ui=false）在此清位；UDS 触发
+                    // （from_ui=true）由 UDS 线程在回包/超时后清位，避免双重清位竞争。
+                    if !from_ui {
+                        self.ui_state.lock().unwrap().downloading = false;
+                        self.mods.download.active = None;
+                    }
+                    // 无论来源均上报 download_end（两条路径 begin→end 配对）。
+                    // 协议 errCode 仅定义 0/1/2；内部扩展值（3=传输超限、4=不支持 file_type）
+                    // 统一映射为 1（协议内"错误"），严格符合字段范围（MXS V2.1.2 §5.6）。
+                    let err_code = match err_code { 0 => 0, 1 => 1, 2 => 2, _ => 1 };
                     let st = if err_code == 0 { "OK" } else { "ERROR" };
                     self.enqueue( UplinkMsg::download_report(&self.cfg.device.id, "download_end", &file_name, file_type, st, err_code, now));
+                }
+                Event::UiUnbind => {
+                    // UI 经 UDS 发起的解绑：组 device_unbind 上行并强制发布（绕过"未绑定不发布"守卫）。
+                    self.enqueue(UplinkMsg::device_unbind(&self.cfg.device.id, now));
+                    self.force_unbind_publish = true;
                 }
                 Event::FileListResult { files } => {
                     let total = files.len();
@@ -205,6 +232,13 @@ impl AppModule {
                 self.mods.login.reply_received = true;
                 self.mods.login.bind_state = bind;
                 self.mods.login.account = msg.account.clone().unwrap_or_default();
+                // 同步 UI 可见绑定状态
+                {
+                    let mut ui = self.ui_state.lock().unwrap();
+                    ui.bind_state = bind;
+                    ui.bound = bind == 0;
+                    ui.account = self.mods.login.account.clone();
+                }
                 // 协议：bindState 0=已绑定 / 1=未绑定 / 2=序列号未录入（与 ConnStateMachine::bound 一致）
                 if bind == 0 {
                     log::info!("login ok, bound");
@@ -228,7 +262,27 @@ impl AppModule {
             "download_begin" => {
                 let ft = msg.file_type.unwrap_or(0);
                 let fname = msg.file_name.clone().unwrap_or_default();
+                // 协议 §5.5：文件下载由服务器发起，设备校验后**必须回 `download_begin`**
+                // （transState/errCode）：忙 → ERROR/1；受理 → OK/0。
+                // 忙闲守卫（AV-1）：与 UDS `download` 共用 `UiState.downloading`。
+                let busy = {
+                    let mut ui = self.ui_state.lock().unwrap();
+                    if ui.downloading {
+                        true
+                    } else {
+                        ui.downloading = true;
+                        false
+                    }
+                };
+                if busy {
+                    log::warn!("download_begin rejected: another download in progress");
+                    self.enqueue( UplinkMsg::download_report(&self.cfg.device.id, "download_begin", &fname, ft, "ERROR", 1, now));
+                    return;
+                }
                 self.mods.download.active = Some((ft, fname.clone()));
+                // 受理即回 download_begin(transState=OK, errCode=0)（协议 §5.5）
+                self.enqueue( UplinkMsg::download_report(&self.cfg.device.id, "download_begin", &fname, ft, "OK", 0, now));
+                let fname_for_err = fname.clone();
                 if let Err(e) = self.cmd_tx.send(DownlinkCmd::DownloadBegin {
                     file_type: ft,
                     file_name: fname,
@@ -236,6 +290,10 @@ impl AppModule {
                     server_ip: msg.server_ip.clone(),
                 }) {
                     log::error!("dispatcher send failed: {e}");
+                    // 入队失败：清位并回 ERROR，避免卡死后续下载。
+                    self.ui_state.lock().unwrap().downloading = false;
+                    self.mods.download.active = None;
+                    self.enqueue( UplinkMsg::download_report(&self.cfg.device.id, "download_begin", &fname_for_err, ft, "ERROR", 1, now));
                 }
             }
             "download_end" => {
@@ -272,6 +330,7 @@ impl MqttModule for AppModule {
     fn on_start(&mut self, outbox: &mut dyn PublishOutbox) {
         let now = protocol::now_ts();
         self.conn.on_connect(now);
+        self.ui_state.lock().unwrap().cloud_connected = true;
         let ip = local_ip().unwrap_or_default();
         let payload = UplinkMsg::login(&self.cfg.device, &ip, now);
         let topic = self.cfg.up_topic();
@@ -326,12 +385,14 @@ impl MqttModule for AppModule {
         // 未绑定（bindState 非 0）时不出队：对齐 m2-software 参考实现
         // （`wifi_send_dev_state_cycle()` 首行 `login_success_flag == false` 即 return，
         //  未绑定时状态包只堆积在 FIFO，不对外发送）。
-        if self.conn.bound {
+        // `force_unbind_publish` 例外：UI 经 UDS 发起的解绑包需绕过该守卫强制发出。
+        if self.conn.bound || self.force_unbind_publish {
             let topic = self.cfg.up_topic();
             while let Some(item) = self.fifo.pop() {
                 self.publish_dbg(outbox, &topic, &item.payload);
             }
             self.force_publish = false;
+            self.force_unbind_publish = false;
         }
 
         TICK_INTERVAL
@@ -372,11 +433,13 @@ mod tests {
             moonraker: crate::config::MoonrakerConfig::default(),
             download: crate::config::DownloadConfig::default(),
             blufi: crate::blufi::BluFiConfig::default(),
+            uds: crate::config::UdsConfig::default(),
         };
         let (event_tx, event_rx) = mpsc::channel::<Event>();
         let (cmd_tx, _cmd_rx) = mpsc::channel::<DownlinkCmd>();
         let state = Arc::new(Mutex::new(AppState::default()));
-        let m = AppModule::new(cfg, state, Arc::new(Mutex::new(event_rx)), cmd_tx);
+        let ui_state: SharedUiState = Arc::new(Mutex::new(Default::default()));
+        let m = AppModule::new(cfg, state, Arc::new(Mutex::new(event_rx)), cmd_tx, ui_state);
         (m, event_tx)
     }
 

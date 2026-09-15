@@ -28,33 +28,78 @@ pub enum DownlinkCmd {
     ServerUnbind,
 }
 
+/// UI（klipper_screen）经 UDS 下发的控制请求。每个请求携带 reply 通道回传结果
+/// （由 UDS 服务线程创建并等待）。UI 侧触发的云侧操作（下载/解绑）经此进入 Dispatcher。
+#[derive(Debug)]
+pub enum UiCmd {
+    /// 文件下载（fileType: 0 GCODE；Klipper 仅支持 gcode，见 D16）。
+    Download { file_type: u8, file_name: String, url: Option<String>, reply_tx: mpsc::Sender<UiReply> },
+    /// 设备解绑（触发 device_unbind 上行）。
+    Unbind { reply_tx: mpsc::Sender<UiReply> },
+}
+
+/// Dispatcher 经 reply 通道回传给 UDS 服务的执行结果。
+#[derive(Debug)]
+pub enum UiReply {
+    Ok(serde_json::Value),
+    Err(String),
+}
+
 pub struct Dispatcher {
     cfg: AppConfig,
     cmd_rx: mpsc::Receiver<DownlinkCmd>,
+    ui_rx: mpsc::Receiver<UiCmd>,
     mr: MrHandle,
     event_tx: mpsc::Sender<Event>,
+    /// Moonraker `gcodes` 根路径（首次查询 `server.files.roots` 成功后缓存；AV-4 校验用）。
+    gcode_root: Option<String>,
 }
 
 impl Dispatcher {
-    pub fn spawn(cfg: AppConfig, cmd_rx: mpsc::Receiver<DownlinkCmd>, mr: MrHandle, event_tx: mpsc::Sender<Event>) {
+    pub fn spawn(
+        cfg: AppConfig,
+        cmd_rx: mpsc::Receiver<DownlinkCmd>,
+        ui_rx: mpsc::Receiver<UiCmd>,
+        mr: MrHandle,
+        event_tx: mpsc::Sender<Event>,
+    ) {
         std::thread::Builder::new()
             .name("dispatcher".into())
             .spawn(move || {
-                let mut d = Self { cfg, cmd_rx, mr, event_tx };
+                let mut d = Self { cfg, cmd_rx, ui_rx, mr, event_tx, gcode_root: None };
                 d.run();
             })
             .expect("spawn dispatcher");
     }
 
     fn run(&mut self) {
-        // 收命令：500ms 超时仅作为「周期性唤醒」，不可作为退出条件——否则空闲 500ms 后
+        // 收命令：200ms 超时仅作为「周期性唤醒」，不可作为退出条件——否则空闲后
         // 线程退出，后续 gcode/下载命令会因接收端已 drop 被静默丢弃（cmd_tx.send 返回 Err）。
-        // 仅在发送端（AppModule）彻底断开（Disconnected）时才退出。
+        // 仅当两个发送端（AppModule/MQTT 下行 与 UDS 控制通道）都彻底断开（Disconnected）时才退出。
+        let mut cmd_dead = false;
+        let mut ui_dead = false;
         loop {
-            match self.cmd_rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(cmd) => self.handle(cmd),
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            if !cmd_dead {
+                match self.cmd_rx.recv_timeout(Duration::from_millis(200)) {
+                    Ok(cmd) => self.handle(cmd),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => cmd_dead = true,
+                }
+            }
+            if !ui_dead {
+                loop {
+                    match self.ui_rx.try_recv() {
+                        Ok(cmd) => self.handle_ui(cmd),
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            ui_dead = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if cmd_dead && ui_dead {
+                break;
             }
         }
     }
@@ -66,8 +111,8 @@ impl Dispatcher {
                 let _ = self.event_tx.send(Event::GcodeResult { cmd_type, result });
             }
             DownlinkCmd::DownloadBegin { file_type, file_name, url, server_ip } => {
-                let err_code = self.download(file_type, &file_name, url.as_deref(), server_ip.as_deref());
-                let _ = self.event_tx.send(Event::DownloadFinished { file_type, file_name, err_code });
+                let (err_code, _dest) = self.download(file_type, &file_name, url.as_deref(), server_ip.as_deref());
+                let _ = self.event_tx.send(Event::DownloadFinished { file_type, file_name, err_code, from_ui: false });
             }
             DownlinkCmd::DeleteFile { file_name } => {
                 let result = self.delete_file(&file_name);
@@ -84,6 +129,33 @@ impl Dispatcher {
             DownlinkCmd::ServerUnbind => {
                 log::warn!("server_unbind received: local binding reset");
                 let _ = self.event_tx.send(Event::GcodeResult { cmd_type: "server_unbind".into(), result: "OK".into() });
+            }
+        }
+    }
+
+    /// 处理 UI（klipper_screen）经 UDS 下发的控制请求，结果经 reply_tx 回传。
+    fn handle_ui(&mut self, cmd: UiCmd) {
+        match cmd {
+            UiCmd::Download { file_type, file_name, url, reply_tx } => {
+                // 协议 §5.5/§5.6：先上行 download_begin（受理），完成后上行 download_end，形成配对。
+                let _ = self.event_tx.send(Event::DownloadStarted { file_type, file_name: file_name.clone() });
+                let (err_code, dest) = self.download(file_type, &file_name, url.as_deref(), None);
+                let _ = self.event_tx.send(Event::DownloadFinished { file_type, file_name, err_code, from_ui: true });
+                let reply = if err_code == 0 {
+                    let result = match dest {
+                        Some(p) => json!({ "err_code": 0, "dest": p }),
+                        None => json!({ "err_code": 0 }),
+                    };
+                    UiReply::Ok(result)
+                } else {
+                    UiReply::Err(format!("download failed: code {err_code}"))
+                };
+                let _ = reply_tx.send(reply);
+            }
+            UiCmd::Unbind { reply_tx } => {
+                // 触发 device_unbind 上行（AppModule 在 drain_events 中组包并强制发布）。
+                let _ = self.event_tx.send(Event::UiUnbind);
+                let _ = reply_tx.send(UiReply::Ok(json!({ "ok": true })));
             }
         }
     }
@@ -114,6 +186,36 @@ impl Dispatcher {
         match self.mr.request("printer.gcode.script", json!({ "script": script }), Duration::from_secs(30)) {
             Ok(_) => "OK".into(),
             Err(e) => format!("ERR: {e}"),
+        }
+    }
+
+    /// 查询并缓存 Moonraker `gcodes` 根路径（`server.files.roots`）；查询失败返回 `None`
+    /// 且**不缓存**，供下次重试（Moonraker 可能尚未连接）。
+    fn gcode_root(&mut self) -> Option<String> {
+        if let Some(r) = &self.gcode_root {
+            return Some(r.clone());
+        }
+        match self.mr.request("server.files.roots", json!({}), Duration::from_secs(5)) {
+            Ok(v) => {
+                let found = v
+                    .as_array()
+                    .and_then(|arr| {
+                        arr.iter().find(|it| it.get("name").and_then(Value::as_str) == Some("gcodes"))
+                    })
+                    .and_then(|it| it.get("path").and_then(Value::as_str))
+                    .map(|s| s.to_string());
+                if let Some(p) = &found {
+                    log::info!("Moonraker gcodes root: {p}");
+                    self.gcode_root = Some(p.clone());
+                } else {
+                    log::warn!("server.files.roots has no 'gcodes' root");
+                }
+                found
+            }
+            Err(e) => {
+                log::warn!("query server.files.roots failed: {e}");
+                None
+            }
         }
     }
 
@@ -150,23 +252,43 @@ impl Dispatcher {
         }
     }
 
-    /// HTTP 下载到 U 盘。err_code：0 成功 / 1 忙或网络错误 / 2 无 U盘或写失败 / 3 传输超时或超限。
+    /// HTTP 下载到 Moonraker `gcodes` 受监控目录（共享目录方案 D16）。返回 `(err_code, dest)`：
+    /// err_code 0 成功 / 1 忙或网络错误 / 2 无目录或写失败 / 3 传输超时或超限 / 4 不支持的 file_type
+    /// （Klipper 侧仅 `0`=gcode 受支持，`1/2` 固件不处理）；成功时 `dest` 为目标绝对路径。
+    ///
+    /// 落盘即被 Moonraker 自动发现，UI 经 `server.files.list` 可见即可打印（**不再调用
+    /// `server.files.upload`**——该接口为 HTTP multipart 端点，WS JSON-RPC 无法传字节，见 SPC §9.3 #2）。
     ///
     /// 流式写入磁盘：按 `download.chunk_size` 分块读取并边读边落盘，同时在读取过程中累加校验
     /// 总量，超过 `max_file_bytes` 立即中止并删除残留文件。避免「先整文件读进内存再校验 512MB」
     /// 导致大文件撑爆内存；也让配置项 `chunk_size` 真正生效。
-    fn download(&mut self, file_type: u8, file_name: &str, url: Option<&str>, _server_ip: Option<&str>) -> u8 {
+    fn download(&mut self, file_type: u8, file_name: &str, url: Option<&str>, _server_ip: Option<&str>) -> (u8, Option<String>) {
         let Some(url) = url.filter(|u| !u.is_empty()) else {
-            return 1;
+            return (1, None);
         };
         let safe = file_name.rsplit(['/', '\\']).next().unwrap_or(file_name).to_string();
         if safe.is_empty() {
-            return 1;
+            return (1, None);
         }
-        let dir = self.cfg.download.dir.clone();
+        // Klipper 侧仅支持 gcode（file_type=0）；固件（1/2）本期不处理（D16）。
+        if file_type != 0 {
+            log::warn!("download: unsupported file_type {file_type} (Klipper supports only 0=gcode)");
+            return (4, None);
+        }
+        // 落地目录须为 Moonraker `gcodes` 受监控目录（配置项，支持 ~ 展开）。
+        let dir = expand_tilde(&self.cfg.download.dir);
+        // AV-4/OQ-U1：校验 download.dir 是否落在 Moonraker `gcodes` 根内；不一致则文件不会被
+        // Moonraker 发现（不进打印列表）——返回 err_code=2 而非静默"成功"。查询不到根（Moonraker
+        // 未连接）时放行并告警，下次下载重试。
+        if let Some(root) = self.gcode_root() {
+            if !std::path::Path::new(&dir).starts_with(&root) {
+                log::error!("download.dir {dir} 不在 Moonraker gcodes 根 {root} 内 -> 文件不会被 Moonraker 发现（AV-4/OQ-U1）");
+                return (2, None);
+            }
+        }
         if std::fs::create_dir_all(&dir).is_err() {
             log::warn!("mkdir failed: {dir}");
-            return 2;
+            return (2, None);
         }
         let dest = std::path::Path::new(&dir).join(&safe);
 
@@ -179,7 +301,7 @@ impl Dispatcher {
             Ok(r) => r,
             Err(e) => {
                 log::warn!("download {url}: {e}");
-                return 1;
+                return (1, None);
             }
         };
 
@@ -190,7 +312,7 @@ impl Dispatcher {
             Ok(f) => f,
             Err(e) => {
                 log::warn!("create {dest:?}: {e}");
-                return 2;
+                return (2, None);
             }
         };
         let mut total: u64 = 0;
@@ -201,36 +323,41 @@ impl Dispatcher {
                 Err(e) => {
                     log::warn!("download read {url}: {e}");
                     let _ = std::fs::remove_file(&dest);
-                    return 3;
+                    return (3, None);
                 }
             };
             total += n as u64;
             if total > max_bytes {
                 log::warn!("download too large: {total} > max {max_bytes}");
                 let _ = std::fs::remove_file(&dest);
-                return 3;
+                return (3, None);
             }
             if let Err(e) = file.write_all(&buf[..n]) {
                 log::warn!("write {dest:?}: {e}");
                 let _ = std::fs::remove_file(&dest);
-                return 2;
+                return (2, None);
             }
         }
         if let Err(e) = file.flush() {
             log::warn!("flush {dest:?}: {e}");
             let _ = std::fs::remove_file(&dest);
-            return 2;
+            return (2, None);
         }
 
-        // GCODE：上传到 Klipper 以支持打印（multipart 上传，简单实现）
-        if file_type == 0 {
-            if let Err(e) = self.mr.request("server.files.upload", json!({ "path": safe }), Duration::from_secs(10)) {
-                log::warn!("klipper upload skipped: {e}");
-            }
-        }
-        log::info!("download ok: {safe} ({total} bytes)");
-        0
+        // 共享目录方案（D16）：落盘即被 Moonraker 自动发现，无需调用 server.files.upload。
+        log::info!("download ok: {safe} -> {dest:?} ({total} bytes)");
+        (0, Some(dest.to_string_lossy().into_owned()))
     }
+}
+
+/// 将 `~/...` 展开为 `$HOME/...`（配置项 `[download] dir` 可能含 `~`）。
+fn expand_tilde(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{home}/{rest}");
+        }
+    }
+    path.to_string()
 }
 
 #[cfg(test)]
