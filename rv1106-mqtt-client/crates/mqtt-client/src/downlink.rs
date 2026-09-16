@@ -137,6 +137,7 @@ impl Dispatcher {
     fn handle_ui(&mut self, cmd: UiCmd) {
         match cmd {
             UiCmd::Download { file_type, file_name, url, reply_tx } => {
+                log::info!("[uds] download: 开始 file_type={file_type} file_name={file_name} url={:?}", url);
                 // 协议 §5.5/§5.6：先上行 download_begin（受理），完成后上行 download_end，形成配对。
                 let _ = self.event_tx.send(Event::DownloadStarted { file_type, file_name: file_name.clone() });
                 let (err_code, dest) = self.download(file_type, &file_name, url.as_deref(), None);
@@ -150,9 +151,11 @@ impl Dispatcher {
                 } else {
                     UiReply::Err(format!("download failed: code {err_code}"))
                 };
+                log::info!("[uds] download: 完成 err_code={err_code}");
                 let _ = reply_tx.send(reply);
             }
             UiCmd::Unbind { reply_tx } => {
+                log::info!("[uds] unbind: 触发 device_unbind 上行");
                 // 触发 device_unbind 上行（AppModule 在 drain_events 中组包并强制发布）。
                 let _ = self.event_tx.send(Event::UiUnbind);
                 let _ = reply_tx.send(UiReply::Ok(json!({ "ok": true })));

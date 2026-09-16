@@ -130,6 +130,8 @@ fn dispatch(req: &[u8], ui_cmd_tx: &mpsc::Sender<UiCmd>, ui_state: &SharedUiStat
     let method = v.get("method").and_then(Value::as_str).unwrap_or("");
     let params = v.get("params").cloned().unwrap_or(Value::Null);
 
+    log::info!("[uds] recv: method={method} id={id}");
+
     match method {
         "bind_status" => {
             let s = ui_state.lock().unwrap();
@@ -162,10 +164,13 @@ fn dispatch(req: &[u8], ui_cmd_tx: &mpsc::Sender<UiCmd>, ui_state: &SharedUiStat
             ui_state.lock().unwrap().downloading = false;
             resp
         }
-        "unbind" => match request(ui_cmd_tx, |tx| UiCmd::Unbind { reply_tx: tx }) {
-            Some(reply) => reply_to_json(&id, reply),
-            None => error_json(&id, "dispatcher unavailable"),
-        },
+        "unbind" => {
+            log::info!("[uds] unbind: 已下发 device_unbind 上行");
+            match request(ui_cmd_tx, |tx| UiCmd::Unbind { reply_tx: tx }) {
+                Some(reply) => reply_to_json(&id, reply),
+                None => error_json(&id, "dispatcher unavailable"),
+            }
+        }
         other => error_json(&id, &format!("unknown method: {other}")),
     }
 }

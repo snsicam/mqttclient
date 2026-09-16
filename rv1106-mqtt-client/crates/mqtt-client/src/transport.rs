@@ -122,6 +122,36 @@ impl MqttTransport for StdTcpTransport {
         debug_bytes("MQTT <<", &buf[..n]);
         Ok(n)
     }
+
+    /// 带超时的接收（仅 std 构建启用）：临时切回阻塞模式 + `set_read_timeout`，真正按 `timeout`
+    /// 阻塞等待，超时返回 `Ok(0)`（空闲），供 `client.poll` 按真实时钟驱动保活/tick。
+    /// 读完恢复非阻塞，供 `send` 等路径使用。
+    async fn recv_timeout(&mut self, buf: &mut [u8], timeout: std::time::Duration) -> Result<usize, StdError> {
+        let stream = self.stream.as_mut().ok_or(StdError::NotConnected)?;
+        stream.set_nonblocking(false).map_err(StdError::from)?;
+        let res = {
+            stream
+                .set_read_timeout(Some(timeout))
+                .map_err(StdError::from)?;
+            stream.read(buf)
+        };
+        // 恢复非阻塞（供 send 等路径使用），忽略恢复失败。
+        let _ = stream.set_nonblocking(true);
+        match res {
+            Ok(0) => Err(StdError::ConnectionClosed), // 对端关闭（EOF）
+            Ok(n) => {
+                debug_bytes("MQTT <<", &buf[..n]);
+                Ok(n)
+            }
+            Err(e) if e.kind() == io::ErrorKind::TimedOut
+                || e.kind() == io::ErrorKind::WouldBlock =>
+            {
+                Ok(0) // 超时无数据：空闲
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok(0),
+            Err(e) => Err(StdError::Io(e)),
+        }
+    }
 }
 
 #[cfg(test)]

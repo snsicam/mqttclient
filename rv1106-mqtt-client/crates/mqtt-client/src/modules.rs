@@ -314,6 +314,14 @@ impl AppModule {
             "device_unbind" => {
                 self.conn.bound = false;
                 self.mods.unbind.pending = false;
+                // 同步 UI 可见绑定状态（与 login 回复一致）：解绑后应为「未绑定」，
+                // 否则 UDS `bind_status` 仍读旧 ui_state.bound，UI 会一直显示「已绑定」。
+                {
+                    let mut ui = self.ui_state.lock().unwrap();
+                    ui.bound = false;
+                    ui.bind_state = 1; // 1=未绑定
+                    ui.account.clear();
+                }
             }
             other => {
                 log::debug!("unknown downlink kind: {other}");
