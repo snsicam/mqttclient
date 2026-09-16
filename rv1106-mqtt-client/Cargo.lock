@@ -985,14 +985,10 @@ dependencies = [
 name = "myrtio-mqtt"
 version = "0.3.0"
 dependencies = [
- "embassy-futures",
  "embassy-sync",
  "embassy-time",
- "embedded-hal 1.0.0",
- "embedded-hal-async",
- "embedded-io-async",
- "futures",
  "heapless 0.9.3",
+ "log",
 ]
 
 [[package]]

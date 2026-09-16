@@ -25,6 +25,8 @@
 //! | `bind_status` | —                                       | 云端/绑定状态（本地应答）       |
 //! | `download`    | `file_type,file_name,url`               | `{"err_code","dest?"}`          |
 //! | `unbind`      | —                                       | `{"ok": true}`（异步上发解绑包）|
+//! | `upgrade_query` | —                                     | `{"server_ip","mcu_file","esp_file"}`（固件查询回复）|
+//! | `upgrade`     | `file_type`(1=MCU/2=ESP)                | `{"err_code","dest?"}`（复用 download，下载固件到 firmware_dir）|
 
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -130,7 +132,7 @@ fn dispatch(req: &[u8], ui_cmd_tx: &mpsc::Sender<UiCmd>, ui_state: &SharedUiStat
     let method = v.get("method").and_then(Value::as_str).unwrap_or("");
     let params = v.get("params").cloned().unwrap_or(Value::Null);
 
-    log::info!("[uds] recv: method={method} id={id}");
+    log::debug!("[uds] << recv: method={method} id={id} payload={}", String::from_utf8_lossy(req));
 
     match method {
         "bind_status" => {
@@ -138,7 +140,6 @@ fn dispatch(req: &[u8], ui_cmd_tx: &mpsc::Sender<UiCmd>, ui_state: &SharedUiStat
             ok_json(&id, json!({
                 "cloud_connected": s.cloud_connected,
                 "moonraker_connected": s.moonraker_connected,
-                "bound": s.bound,
                 "bind_state": s.bind_state,
                 "account": s.account,
             }))
@@ -170,6 +171,43 @@ fn dispatch(req: &[u8], ui_cmd_tx: &mpsc::Sender<UiCmd>, ui_state: &SharedUiStat
                 Some(reply) => reply_to_json(&id, reply),
                 None => error_json(&id, "dispatcher unavailable"),
             }
+        }
+        "upgrade_query" => {
+            // 查询固件：转发 AppModule 发布 upgrade_query 上行，服务器回包含 mcuFile/espFile/serverIp。
+            match request(ui_cmd_tx, |tx| UiCmd::UpgradeQuery { reply_tx: tx }) {
+                Some(reply) => reply_to_json(&id, reply),
+                None => error_json(&id, "dispatcher unavailable"),
+            }
+        }
+        "upgrade" => {
+            // 触发固件下载：复用 download 机制，但 file_type=1/2 落盘 firmware_dir。
+            // 忙闲守卫（与 download 共用 UiState.downloading）。
+            {
+                let mut s = ui_state.lock().unwrap();
+                if s.downloading {
+                    return ok_json(&id, json!({ "err_code": 1, "msg": "busy" }));
+                }
+                s.downloading = true;
+            }
+            let file_type = params.get("file_type").and_then(Value::as_u64).unwrap_or(1) as u8;
+            // 取对应固件文件名与服务器 IP（来自此前 upgrade_query 查询结果）。
+            let (fname, server_ip) = {
+                let s = ui_state.lock().unwrap();
+                let f = if file_type == 2 { s.firmware_esp_file.clone() } else { s.firmware_mcu_file.clone() };
+                (f, s.firmware_server_ip.clone())
+            };
+            if fname.is_empty() || fname == "NA" || server_ip.is_empty() {
+                ui_state.lock().unwrap().downloading = false;
+                return ok_json(&id, json!({ "err_code": 2, "msg": "no firmware / not queried" }));
+            }
+            // 由查询回复的 serverIp + fileName 构造 HTTP 下载地址。
+            let url = format!("http://{}/{}", server_ip, fname);
+            let resp = match request(ui_cmd_tx, |tx| UiCmd::Download { file_type, file_name: fname, url: Some(url), reply_tx: tx }) {
+                Some(reply) => reply_to_json(&id, reply),
+                None => error_json(&id, "dispatcher unavailable"),
+            };
+            ui_state.lock().unwrap().downloading = false;
+            resp
         }
         other => error_json(&id, &format!("unknown method: {other}")),
     }
@@ -228,6 +266,7 @@ fn write_frame(stream: &mut UnixStream, payload: &[u8]) -> std::io::Result<()> {
     if payload.len() > MAX_MSG_LEN {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "payload too large"));
     }
+    log::debug!("[uds] >> send ({}B): {}", payload.len(), String::from_utf8_lossy(payload));
     let len = (payload.len() as u32).to_le_bytes();
     stream.write_all(&len)?;
     stream.write_all(payload)?;

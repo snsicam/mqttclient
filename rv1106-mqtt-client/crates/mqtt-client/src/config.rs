@@ -171,6 +171,10 @@ pub struct DownloadConfig {
     /// Moonraker `gcodes` 受监控目录（GCODE 下载落地；须与 Moonraker `[file_manager] gcode_path` 一致；支持 ~ 展开）。
     #[serde(default = "default_dl_dir")]
     pub dir: String,
+    /// 固件（file_type 1=主控 / 2=ESP）下载落地目录，与 gcode 的 Moonraker gcodes 目录分离
+    ///（固件不应进打印列表）；支持 ~ 展开。
+    #[serde(default = "default_fw_dir")]
+    pub firmware_dir: String,
     /// 最大下载字节数。
     #[serde(default = "default_max_file")]
     pub max_file_bytes: u64,
@@ -199,7 +203,7 @@ impl Default for MoonrakerConfig {
 }
 impl Default for DownloadConfig {
     fn default() -> Self {
-        Self { dir: default_dl_dir(), max_file_bytes: default_max_file(), chunk_size: default_chunk() }
+        Self { dir: default_dl_dir(), firmware_dir: default_fw_dir(), max_file_bytes: default_max_file(), chunk_size: default_chunk() }
     }
 }
 
@@ -226,6 +230,7 @@ fn default_model() -> String { DEFAULT_MODEL.to_string() }
 fn default_mr_host() -> String { "127.0.0.1".into() }
 fn default_mr_port() -> u16 { 7125 }
 fn default_dl_dir() -> String { "~/printer_data/gcodes/cloud".into() }
+fn default_fw_dir() -> String { "~/printer_data/firmware".into() }
 fn default_max_file() -> u64 { 512 * 1024 * 1024 }
 fn default_chunk() -> usize { 64 * 1024 }
 fn default_uds_enabled() -> bool { true }
@@ -282,6 +287,9 @@ impl AppConfig {
         }
         if self.download.chunk_size == 0 {
             return Err(ConfigError::Invalid("download.chunk_size 非法".into()));
+        }
+        if self.download.firmware_dir.is_empty() {
+            return Err(ConfigError::Invalid("download.firmware_dir 不能为空".into()));
         }
         Ok(())
     }

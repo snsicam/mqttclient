@@ -22,8 +22,6 @@ pub enum DownlinkCmd {
     DeleteFile { file_name: String },
     /// 文件列表查询（M20）。
     ListFiles,
-    /// 升级查询回复。
-    UpgradeQuery,
     /// 服务器解绑。
     ServerUnbind,
 }
@@ -36,6 +34,8 @@ pub enum UiCmd {
     Download { file_type: u8, file_name: String, url: Option<String>, reply_tx: mpsc::Sender<UiReply> },
     /// 设备解绑（触发 device_unbind 上行）。
     Unbind { reply_tx: mpsc::Sender<UiReply> },
+    /// 固件升级查询：由 AppModule 发布 `upgrade_query` 上行，回复经 `reply_tx` 回 UDS/UI。
+    UpgradeQuery { reply_tx: mpsc::Sender<UiReply> },
 }
 
 /// Dispatcher 经 reply 通道回传给 UDS 服务的执行结果。
@@ -122,10 +122,6 @@ impl Dispatcher {
                 let files = self.list_files();
                 let _ = self.event_tx.send(Event::FileListResult { files });
             }
-            DownlinkCmd::UpgradeQuery => {
-                // 无升级服务器：保持协议兼容回复
-                let _ = self.event_tx.send(Event::GcodeResult { cmd_type: "upgrade_query".into(), result: "NO_UPGRADE".into() });
-            }
             DownlinkCmd::ServerUnbind => {
                 log::warn!("server_unbind received: local binding reset");
                 let _ = self.event_tx.send(Event::GcodeResult { cmd_type: "server_unbind".into(), result: "OK".into() });
@@ -159,6 +155,10 @@ impl Dispatcher {
                 // 触发 device_unbind 上行（AppModule 在 drain_events 中组包并强制发布）。
                 let _ = self.event_tx.send(Event::UiUnbind);
                 let _ = reply_tx.send(UiReply::Ok(json!({ "ok": true })));
+            }
+            UiCmd::UpgradeQuery { reply_tx } => {
+                // 转交 AppModule：由其发布 upgrade_query 上行并暂存 reply_tx，待服务器回包。
+                let _ = self.event_tx.send(Event::UpgradeQueryRequested { reply_tx: Some(reply_tx) });
             }
         }
     }
@@ -273,20 +273,25 @@ impl Dispatcher {
         if safe.is_empty() {
             return (1, None);
         }
-        // Klipper 侧仅支持 gcode（file_type=0）；固件（1/2）本期不处理（D16）。
-        if file_type != 0 {
-            log::warn!("download: unsupported file_type {file_type} (Klipper supports only 0=gcode)");
-            return (4, None);
-        }
-        // 落地目录须为 Moonraker `gcodes` 受监控目录（配置项，支持 ~ 展开）。
-        let dir = expand_tilde(&self.cfg.download.dir);
-        // AV-4/OQ-U1：校验 download.dir 是否落在 Moonraker `gcodes` 根内；不一致则文件不会被
+        // 落地目录：gcode(file_type=0) 走 Moonraker `gcodes` 受监控目录；固件(1=主控/2=ESP)
+        // 走独立的 firmware_dir，不进打印列表（D16）。
+        let (dir, is_gcode) = match file_type {
+            0 => (expand_tilde(&self.cfg.download.dir), true),
+            1 | 2 => (expand_tilde(&self.cfg.download.firmware_dir), false),
+            _ => {
+                log::warn!("download: unsupported file_type {file_type}");
+                return (4, None);
+            }
+        };
+        // AV-4/OQ-U1：仅 gcode 需校验落在 Moonraker `gcodes` 根内；不一致则文件不会被
         // Moonraker 发现（不进打印列表）——返回 err_code=2 而非静默"成功"。查询不到根（Moonraker
-        // 未连接）时放行并告警，下次下载重试。
-        if let Some(root) = self.gcode_root() {
-            if !std::path::Path::new(&dir).starts_with(&root) {
-                log::error!("download.dir {dir} 不在 Moonraker gcodes 根 {root} 内 -> 文件不会被 Moonraker 发现（AV-4/OQ-U1）");
-                return (2, None);
+        // 未连接）时放行并告警，下次下载重试。固件不走此校验。
+        if is_gcode {
+            if let Some(root) = self.gcode_root() {
+                if !std::path::Path::new(&dir).starts_with(&root) {
+                    log::error!("download.dir {dir} 不在 Moonraker gcodes 根 {root} 内 -> 文件不会被 Moonraker 发现（AV-4/OQ-U1）");
+                    return (2, None);
+                }
             }
         }
         if std::fs::create_dir_all(&dir).is_err() {

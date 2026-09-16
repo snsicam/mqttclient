@@ -9,13 +9,15 @@
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
+use serde_json::json;
+
 use embassy_time::Duration;
 use myrtio_mqtt::runtime::{MqttModule, Publish, PublishOutbox, TopicCollector};
 use myrtio_mqtt::QoS;
 
 use crate::app_state::AppState;
 use crate::config::AppConfig;
-use crate::downlink::DownlinkCmd;
+use crate::downlink::{DownlinkCmd, UiReply};
 use crate::protocol::{self, DownlinkMsg, UplinkMsg};
 use crate::state::{ConnState, ConnStateMachine, Event, FifoItem, SharedUiState, UplinkFifo};
 
@@ -56,6 +58,13 @@ pub struct DownloadModule {
 #[derive(Default)]
 pub struct UpgradeModule {
     pub last_query_ts: u64,
+    /// UI 经 UDS 发起 upgrade_query 后暂存回复通道，待服务器下行回复时回填（见 `upgrade_query` 下行处理）。
+    pub pending_reply: Option<mpsc::Sender<UiReply>>,
+    /// 每次 UI 发起 upgrade_query 自增的序号。下行回复到达时把 `result_seq` 置为当前 `query_seq`，
+    /// 用以在「下行先于事件被排空」的竞态下仍能闭环（见 `Event::UpgradeQueryRequested` 与 `upgrade_query` 下行处理）。
+    pub query_seq: u64,
+    /// 下行回复所应答的查询序号；为 0 表示尚无回复。事件侧据此判断是否已有结果可立即回包。
+    pub result_seq: u64,
 }
 
 #[derive(Default)]
@@ -182,6 +191,28 @@ impl AppModule {
                 Event::GcodeResult { cmd_type, result } => {
                     self.enqueue( UplinkMsg::gcode_reply(&self.cfg.device.id, &cmd_type, &result, now));
                 }
+                Event::UpgradeQueryRequested { reply_tx } => {
+                    // UI 经 UDS 发起固件查询：发布 upgrade_query 上行，并暂存回复通道待服务器回包。
+                    self.mods.upgrade.query_seq += 1;
+                    let seq = self.mods.upgrade.query_seq;
+                    self.mods.upgrade.pending_reply = reply_tx;
+                    self.enqueue(UplinkMsg::upgrade_query(&self.cfg.device.id, now));
+                    // 竞态补偿：云端可能在 `drain_events` 把 pending_reply 设好之前就回了下行
+                    // （本地/测试 broker 常同毫秒应答）。若下行已先到（result_seq 命中本序号），
+                    // 直接拿 UiState 里的固件信息回包，避免一次性通道被丢弃导致 UI 永久超时。
+                    if self.mods.upgrade.result_seq == seq {
+                        if let Some(tx) = self.mods.upgrade.pending_reply.take() {
+                            let ui = self.ui_state.lock().unwrap();
+                            let mcu = if ui.firmware_mcu_file == "NA" { "" } else { ui.firmware_mcu_file.as_str() };
+                            let esp = if ui.firmware_esp_file == "NA" { "" } else { ui.firmware_esp_file.as_str() };
+                            let _ = tx.send(UiReply::Ok(json!({
+                                "server_ip": ui.firmware_server_ip,
+                                "mcu_file": mcu,
+                                "esp_file": esp,
+                            })));
+                        }
+                    }
+                }
                 Event::DownloadStarted { file_type, file_name } => {
                     // 协议 §5.5：设备→服务器 `download_begin`（受理 transState=OK / errCode=0）。
                     self.enqueue( UplinkMsg::download_report(&self.cfg.device.id, "download_begin", &file_name, file_type, "OK", 0, now));
@@ -204,6 +235,13 @@ impl AppModule {
                     // UI 经 UDS 发起的解绑：组 device_unbind 上行并强制发布（绕过"未绑定不发布"守卫）。
                     self.enqueue(UplinkMsg::device_unbind(&self.cfg.device.id, now));
                     self.force_unbind_publish = true;
+                    // 本地即时把 UI 可见状态置为「未绑定」：不等待云端 device_unbind 回显
+                    // （未绑定/未录入设备点击解绑后云端不会回显，否则 bind_status 仍返回旧态）。
+                    {
+                        let mut ui = self.ui_state.lock().unwrap();
+                        ui.bind_state = 1; // 1=未绑定
+                        ui.account.clear();
+                    }
                 }
                 Event::FileListResult { files } => {
                     let total = files.len();
@@ -236,7 +274,6 @@ impl AppModule {
                 {
                     let mut ui = self.ui_state.lock().unwrap();
                     ui.bind_state = bind;
-                    ui.bound = bind == 0;
                     ui.account = self.mods.login.account.clone();
                 }
                 // 协议：bindState 0=已绑定 / 1=未绑定 / 2=序列号未录入（与 ConnStateMachine::bound 一致）
@@ -301,24 +338,51 @@ impl AppModule {
                 self.mods.download.active = None;
             }
             "upgrade_query" => {
-                self.mods.upgrade.last_query_ts = now;
-                let _ = self.cmd_tx.send(DownlinkCmd::UpgradeQuery);
+                // 服务器对升级查询的**回复**（含 serverIp / mcuFile / espFile），非发起查询。
+                // 捕获固件信息到 UiState，并回填等待中的 UDS 查询结果。
+                let server_ip = msg.server_ip.clone().unwrap_or_default();
+                let mcu = msg.mcu_file.clone().unwrap_or_default();
+                let esp = msg.esp_file.clone().unwrap_or_default();
+                {
+                    let mut ui = self.ui_state.lock().unwrap();
+                    ui.firmware_server_ip = server_ip.clone();
+                    ui.firmware_mcu_file = mcu.clone();
+                    ui.firmware_esp_file = esp.clone();
+                }
+                // 标记本下行回复所应答的查询序号（命中当前在途查询）；若无等待中的 pending_reply，
+                // 仅置位 result_seq，由 `Event::UpgradeQueryRequested` 在事件被排空时立即回包（竞态补偿）。
+                self.mods.upgrade.result_seq = self.mods.upgrade.query_seq;
+                // 若有等待中的 UI 查询请求，回传固件信息（mcuFile/espFile 为 "NA" 表示无对应固件）。
+                if let Some(tx) = self.mods.upgrade.pending_reply.take() {
+                    let _ = tx.send(UiReply::Ok(json!({
+                        "server_ip": server_ip,
+                        "mcu_file": if mcu == "NA" { "" } else { mcu.as_str() },
+                        "esp_file": if esp == "NA" { "" } else { esp.as_str() },
+                    })));
+                }
             }
             "file_list" => {
                 let _ = self.cmd_tx.send(DownlinkCmd::ListFiles);
             }
             "server_unbind" => {
+                // 云端发起解绑：本地绑定态需同步清零（与 device_unbind 一致），
+                // 否则 UDS `bind_status` 仍读旧 ui_state，UI 一直显示「已绑定」。
+                self.conn.bound = false;
                 self.mods.unbind.pending = true;
+                {
+                    let mut ui = self.ui_state.lock().unwrap();
+                    ui.bind_state = 1; // 1=未绑定
+                    ui.account.clear();
+                }
                 let _ = self.cmd_tx.send(DownlinkCmd::ServerUnbind);
             }
             "device_unbind" => {
                 self.conn.bound = false;
                 self.mods.unbind.pending = false;
                 // 同步 UI 可见绑定状态（与 login 回复一致）：解绑后应为「未绑定」，
-                // 否则 UDS `bind_status` 仍读旧 ui_state.bound，UI 会一直显示「已绑定」。
+                // 否则 UDS `bind_status` 仍读旧 ui_state，UI 会一直显示「已绑定」。
                 {
                     let mut ui = self.ui_state.lock().unwrap();
-                    ui.bound = false;
                     ui.bind_state = 1; // 1=未绑定
                     ui.account.clear();
                 }

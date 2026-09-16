@@ -11,7 +11,7 @@ default = []
 # 设备型号由配置文件 `[mqtt] model` 决定（默认 M1S），无需编译期 feature。
 
 [dependencies]
-myrtio-mqtt = { workspace = true, features = ["std"] }
+myrtio-mqtt = { workspace = true, features = ["log"] }
 embassy-time.workspace = true
 embassy-sync.workspace = true
 embassy-futures.workspace = true

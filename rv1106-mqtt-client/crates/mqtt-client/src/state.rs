@@ -1,6 +1,9 @@
 //! 连接状态机 / 10 槽上行 FIFO / 内部事件（LLD-003 §7.1/§7.5/§5）。
 
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+
+use crate::downlink::UiReply;
 
 // ---------------------------------------------------------------------------
 // 内部事件：Moonraker / dispatcher → AppModule
@@ -29,6 +32,9 @@ pub enum Event {
     Alarm { err_type: u8, err_msg: String },
     /// UI 经 UDS 发起的设备解绑请求（触发 device_unbind 上行）。
     UiUnbind,
+    /// UI 经 UDS 发起的固件升级查询：AppModule 据此发布 `upgrade_query` 上行，
+    /// 并暂存回复通道（reply_tx），待服务器下行回复后回填 UDS 响应。
+    UpgradeQueryRequested { reply_tx: Option<mpsc::Sender<UiReply>> },
 }
 
 // ---------------------------------------------------------------------------
@@ -36,21 +42,40 @@ pub enum Event {
 // ---------------------------------------------------------------------------
 
 /// UI 关心的云连接/绑定状态镜像，由 AppModule 在连接/登录变化时更新。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct UiState {
     /// 已连上 MQTT Broker。
     pub cloud_connected: bool,
     /// Moonraker（Klippy）已连接。
     pub moonraker_connected: bool,
-    /// 是否已绑定账号（bindState==0）。
-    pub bound: bool,
     /// 最近一次 login 回复的 bindState（0=已绑定/1=未绑定/2=未录入）。
+    /// 绑定态只由此 3 值决定，`bound` 是其冗余派生量，不再单独存储/下发。
     pub bind_state: u8,
     /// 绑定的云端账号。
     pub account: String,
+    /// 固件升级查询结果（服务器 `upgrade_query` 下行回复填充，供 UDS 返回 UI 显示固件文件名）。
+    pub firmware_server_ip: String,
+    pub firmware_mcu_file: String,
+    pub firmware_esp_file: String,
     /// 下载忙闲标志（AV-1）：任一入口（MQTT `download_begin` / UDS `download`）置位，
     /// 完成后清位；用于拒绝并发/叠加下载（协议忙语义，err_code=1）。
     pub downloading: bool,
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self {
+            cloud_connected: false,
+            moonraker_connected: false,
+            // 默认 2=未录入：尚未收到 login 回复时状态未知，UI 必须显示「未录入」而非误判「已绑定」。
+            bind_state: 2,
+            account: String::new(),
+            firmware_server_ip: String::new(),
+            firmware_mcu_file: String::new(),
+            firmware_esp_file: String::new(),
+            downloading: false,
+        }
+    }
 }
 
 /// 跨线程共享的 UI 状态（AppModule 写、UDS 服务读）。
