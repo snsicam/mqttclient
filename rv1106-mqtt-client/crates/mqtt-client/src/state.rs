@@ -97,6 +97,8 @@ pub enum ConnState {
 pub const LOGIN_REPLY_TIMEOUT_SECS: u64 = 15;
 pub const HEARTBEAT_IDLE_SECS: u64 = 3 * 60; // 3min 无下行 → 状态上报
 pub const MAX_LOGIN_ATTEMPTS: u8 = 3;
+/// 未绑定时轮询重发 login 的间隔（R1 §5.1：平台侧绑定完成前，设备持续登录）。
+pub const UNBOUND_RETRY_INTERVAL_SECS: u64 = 5;
 
 /// MQTT 连接状态机（LLD-003 §7.2）。
 #[derive(Debug, Clone)]
@@ -109,6 +111,8 @@ pub struct ConnStateMachine {
     pub bound: bool,
     /// 最近一次 login 回复的 bindState（0=已绑定 / 1=未绑定 / 2=未录入）。
     pub bind_state: u8,
+    /// 最近一次（未绑定轮询）login 发送时间，用于控制每 5s 重发（见 UNBOUND_RETRY_INTERVAL_SECS）。
+    pub last_unbound_retry_ts: u64,
 }
 
 impl Default for ConnStateMachine {
@@ -121,6 +125,7 @@ impl Default for ConnStateMachine {
             last_status_publish_ts: 0,
             bound: false,
             bind_state: 0,
+            last_unbound_retry_ts: 0,
         }
     }
 }
@@ -132,6 +137,7 @@ impl ConnStateMachine {
         self.login_attempts = 0;
         self.last_downlink_ts = now;
         self.bound = false;
+        self.last_unbound_retry_ts = now;
     }
 
     /// login 包已发出。
@@ -151,6 +157,7 @@ impl ConnStateMachine {
         self.login_attempts = 0;
         self.state = ConnState::Ready;
         self.last_downlink_ts = now;
+        self.last_unbound_retry_ts = now;
     }
 
     /// 收到任意下行包（刷新"有下行"时间）。

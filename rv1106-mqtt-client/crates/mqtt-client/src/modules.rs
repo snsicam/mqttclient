@@ -19,7 +19,7 @@ use crate::app_state::AppState;
 use crate::config::AppConfig;
 use crate::downlink::{DownlinkCmd, UiReply};
 use crate::protocol::{self, DownlinkMsg, UplinkMsg};
-use crate::state::{ConnState, ConnStateMachine, Event, FifoItem, SharedUiState, UplinkFifo};
+use crate::state::{ConnState, ConnStateMachine, Event, FifoItem, MAX_LOGIN_ATTEMPTS, SharedUiState, UplinkFifo, UNBOUND_RETRY_INTERVAL_SECS};
 
 const UPLINK_FIFO_CAP: usize = 10;
 const TICK_INTERVAL: Duration = Duration::from_millis(500);
@@ -428,14 +428,41 @@ impl MqttModule for AppModule {
         // 1. 消费事件
         self.drain_events();
 
-        // 2. login 回复超时：标记错误（由外层 keepalive 断线驱动重连）
+        // 2. login 回复超时处理：连接仍存活则主动重发 login（给平台第二次机会，
+        //    避免仅靠 keepalive 断线才重登导致期间不登录）；重试超限再标记错误由断线重连。
         if self.conn.login_reply_timeout(now) {
-            log::warn!("login reply timeout");
-            self.conn.on_error();
+            if self.conn.login_attempts >= MAX_LOGIN_ATTEMPTS {
+                log::warn!("login reply timeout after {} attempts, force reconnect", self.conn.login_attempts);
+                self.conn.on_error();
+            } else {
+                log::warn!("login reply timeout, resend login (attempt {})", self.conn.login_attempts + 1);
+                let ip = local_ip().unwrap_or_default();
+                let payload = UplinkMsg::login(&self.cfg.device, &ip, now);
+                let topic = self.cfg.up_topic();
+                self.publish_dbg(outbox, &topic, &payload);
+                self.conn.on_login_sent(now);
+            }
         }
 
-        // 3. 心跳：Ready 且 3min 无下行 → 状态上报
-        if self.conn.heartbeat_due(now) {
+        // 2.5 未绑定轮询：已 Ready 但平台未绑定（bindState≠0），每 5s 重发 login，
+        //     直到平台侧完成绑定（下次 login 回复 bindState=0）。
+        //     与 login_reply_timeout 区分：此处连接健康、已收到回复，仅因未绑定而轮询；
+        //     不计入 login_attempts / should_reconnect，不会触发断线重连。
+        if self.conn.state == ConnState::Ready && !self.conn.bound {
+            if now.saturating_sub(self.conn.last_unbound_retry_ts) >= UNBOUND_RETRY_INTERVAL_SECS {
+                log::info!("unbound: resend login (polling every {}s)", UNBOUND_RETRY_INTERVAL_SECS);
+                let ip = local_ip().unwrap_or_default();
+                let payload = UplinkMsg::login(&self.cfg.device, &ip, now);
+                let topic = self.cfg.up_topic();
+                self.publish_dbg(outbox, &topic, &payload);
+                self.conn.last_unbound_retry_ts = now;
+            }
+        }
+
+        // 3. 心跳：已 login（Ready 且 bound）且 3min 无下行 → 状态上报。
+        //    未 login（连接已建立但 login 回复未达 / 未绑定）不报状态包，
+        //    必须先完成 login 才允许上报（对齐 FIFO/周期上报的 bound 守卫）。
+        if self.conn.state == ConnState::Ready && self.conn.bound && self.conn.heartbeat_due(now) {
             log::info!("heartbeat: no downlink 3min, publish status");
             self.publish_status_packs(outbox);
             self.conn.last_status_publish_ts = now;
@@ -597,5 +624,23 @@ mod tests {
         let mut outbox2 = Recorder::default();
         m.on_tick(&mut outbox2);
         assert!(!outbox2.items.is_empty(), "绑定后应恢复发布");
+    }
+
+    /// 回归：未绑定时必须持续（每 5s）重发 login，直到平台侧绑定完成。
+    /// 之前 on_login_reply 一律 state=Ready + 清 login_sent_at_ts，导致 login_reply_timeout
+    /// 不再触发，未绑定设备再也不重发 login（丢失「5s 重连/登录」机制）。
+    #[test]
+    fn unbound_polls_login() {
+        let (mut m, _tx) = test_module();
+        m.handle_downlink(&DownlinkMsg::parse(br#"{"type":"login","bindState":1}"#).unwrap());
+        assert!(!m.conn.bound);
+        // 模拟距上次轮询已过去 5s 以上：把基准时间置 0（now 为真实 unix 秒，必然 >=5）
+        m.conn.last_unbound_retry_ts = 0;
+        let mut outbox = Recorder::default();
+        m.on_tick(&mut outbox);
+        let has_login = outbox.items.iter().any(|(_t, p)| {
+            String::from_utf8_lossy(p).contains("\"type\":\"login\"")
+        });
+        assert!(has_login, "未绑定时应每 5s 轮询重发 login，实际: {:?}", outbox.items);
     }
 }

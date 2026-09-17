@@ -399,8 +399,6 @@ fn extract_ip(status: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn run_checked_treats_fail_as_error() {
         // wpa_cli 失败时退出码为 0 但输出 FAIL；run_checked 必须把它当错误（否则 save_config
