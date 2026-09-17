@@ -74,6 +74,12 @@ pub struct BluFiConfig {
     pub scan_timeout_ms: u64,
     #[serde(default = "default_conn_to")]
     pub connect_timeout_ms: u64,
+    /// 已关联 AP 时扫描回退：AIC8800 等芯片关联后 off-channel 扫描失效，
+    /// `scan_results` 恒为空（配网后第二次取列表即 0 个网络）。
+    /// 开启后：若「已连接却扫到空」，先 `disconnect` 触发全信道扫描，再 `reconnect` 恢复连接并重起 udhcpc。
+    /// 代价：扫描期间 WiFi/云连接短暂断开约 1~2s。默认 `true`。
+    #[serde(default = "default_scan_disconnect_fallback")]
+    pub scan_disconnect_fallback: bool,
     #[serde(default = "default_ack_repeat")]
     pub ack_repeat: u8,
     /// 扫描列表单帧字节上限。`0` = 不限：超过 255 字节时由 `send_data` 自动按 BluFi
@@ -109,6 +115,7 @@ impl Default for BluFiConfig {
             dbus_timeout_ms: default_dbus_to(),
             scan_timeout_ms: default_scan_to(),
             connect_timeout_ms: default_conn_to(),
+            scan_disconnect_fallback: default_scan_disconnect_fallback(),
             ack_repeat: default_ack_repeat(),
             scan_single_frame_bytes: default_scan_single_frame_bytes(),
             ack_interval_ms: default_ack_interval(),
@@ -162,6 +169,9 @@ fn default_scan_to() -> u64 {
 }
 fn default_conn_to() -> u64 {
     30000
+}
+fn default_scan_disconnect_fallback() -> bool {
+    true
 }
 fn default_ack_repeat() -> u8 {
     3

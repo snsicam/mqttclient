@@ -41,6 +41,8 @@ pub struct WifiManager {
     bin: String,
     scan_timeout: Duration,
     connect_timeout: Duration,
+    /// 已关联时扫描回退（见 [`WifiManager::scan`]）：AIC8800 等芯片关联后 off-channel 扫描失效。
+    scan_disconnect_fallback: bool,
 }
 
 /// 扫描阶段读取 `scan_results` 的次数（合并去重，见 [`WifiManager::scan`]）。
@@ -59,6 +61,7 @@ impl WifiManager {
             bin: "wpa_cli".to_string(),
             scan_timeout: Duration::from_millis(cfg.scan_timeout_ms),
             connect_timeout: Duration::from_millis(cfg.connect_timeout_ms),
+            scan_disconnect_fallback: cfg.scan_disconnect_fallback,
         }
     }
 
@@ -110,13 +113,76 @@ impl WifiManager {
     /// 触发扫描后，等待 `scan_timeout`（默认 5 秒）让 wpa_supplicant 完成一次扫描，
     /// 再读 `SCAN_READS`（3）次 `scan_results`（间隔 `SCAN_READ_GAP`），合并去重后回送 APP。
     /// `scan` 是异步的，故先等待再多次读取合并，而非「首次非空即返回」。
+    ///
+    /// **已关联回退（AIC8800 等芯片）**：部分驱动关联 AP 后无法做 off-channel 扫描，
+    /// `scan` 触发成功但 `scan_results` 恒为空（实测：配网后第二次取 WiFi 列表返回 0 个网络，
+    /// 而断开关联后的普通扫描正常）。开启 `scan_disconnect_fallback` 时，一旦检测到已关联即
+    /// **直接**临时 `disconnect` 让驱动做全信道扫描，扫完 `reconnect` 恢复关联并重起 udhcpc 拿回 IP。
+    /// 走单程（不先尝试再做回退）是为避免两次 `scan` 叠加超过 APP 的 10s 列表超时；断开支路的
+    /// 等待上限 4s，保证总耗时（≈0.5s + 4s + 读间隔）稳稳低于 10s。代价：扫描期间 WiFi/云连接
+    /// 短暂断开约 1~2s（配网交互窗口内可接受）。关闭该开关（`scan_disconnect_fallback=false`）
+    /// 则始终走普通扫描（适用于关联后扫描正常的其它芯片）。
+    ///
+    /// **注意**：此回退只治标。已关联时扫描为空，真正常见根因是**电源/SDIO 总线不稳**
+    /// （内核 `sdio_err` -84/-110 + `rv1106_npor_powergood_isr voltage jitter detected`），
+    /// 关联后芯片高功耗把供电轨拉抖，SDIO 传输损坏/超时；断开回到空闲低功耗态总线才稳。
+    /// 若电源抖到连空闲扫描都失败，本回退也救不回（仍返回空）——此时需修硬件电源，
+    /// 见下方「断开后仍为空」的告警。
     pub fn scan(&self) -> Result<Vec<super::ScanItem>, WifiError> {
+        // 已关联 AP：关联态扫描不稳，直接临时断开做全信道扫描（回到空闲低功耗态）。
+        let merged = if self.scan_disconnect_fallback && self.is_connected() {
+            log::warn!(
+                "blufi: interface associated — temporary disconnect to scan (scan while associated unreliable: power/SDIO instability)"
+            );
+            // 断开关联，使芯片回到空闲低功耗态、SDIO 总线恢复稳定
+            if let Err(e) = self.run(&["disconnect"]) {
+                log::warn!("blufi: disconnect before scan failed (ignored): {e}");
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            // 断关联后扫描；等待上限 4s 以稳稳低于 APP 10s 列表超时
+            let wait = Duration::from_millis(std::cmp::min(self.scan_timeout.as_millis(), 4000) as u64);
+            let r = self.scan_once(wait)?;
+            // 恢复之前的关联（重连到已选网络）；失败仅告警，不阻断回送列表
+            if let Err(e) = self.run(&["reconnect"]) {
+                log::warn!("blufi: reconnect after scan failed (ignored): {e}");
+            }
+            // 关联恢复后重起 udhcpc，重新 DHCP 拿 IP（避免 IP 丢失）
+            self.start_dhcp();
+            r
+        } else {
+            // 未关联（首次配网前）或已关闭回退：常规扫描
+            self.scan_once(self.scan_timeout)?
+        };
+
+        // 已关联回退后仍为空：说明连空闲态 SDIO 都不稳，几乎可断定是电源/硬件问题，明指方向。
+        if merged.is_empty() && self.scan_disconnect_fallback && self.is_connected() {
+            log::warn!(
+                "blufi: scan STILL empty after disconnect — likely power/SDIO instability; \
+                 check `dmesg` for `sdio_err` (-84/-110) and `rv1106_npor_powergood_isr voltage jitter`"
+            );
+        }
+
+        let summary: Vec<String> = merged
+            .iter()
+            .map(|s| format!("{} ({}dBm)", s.ssid, s.rssi))
+            .collect();
+        log::info!(
+            "blufi: scan returned {} wifi network(s): [{}]",
+            merged.len(),
+            summary.join(", ")
+        );
+        Ok(merged)
+    }
+
+    /// 单次扫描：触发 `scan` → 等 `wait` → 读 `SCAN_READS` 次 `scan_results` 合并去重。
+    /// `wait` 由调用方传入（普通路径用 `scan_timeout`，已关联回退路径用上限 4s）。
+    fn scan_once(&self, wait: Duration) -> Result<Vec<super::ScanItem>, WifiError> {
         // 触发扫描；wpa_supplicant 正在扫描时可能临时拒绝，仅告警不阻断（结果仍可读取）。
         if let Err(e) = self.run(&["scan"]) {
             log::warn!("blufi: scan trigger failed (ignored): {e}");
         }
         // 定时器：等待一次完整扫描完成
-        std::thread::sleep(self.scan_timeout);
+        std::thread::sleep(wait);
 
         // 读三次 scan_results，合并去重；读取失败直接报错（避免「空列表=成功」误导 APP）
         let mut merged: Vec<super::ScanItem> = Vec::new();
@@ -129,16 +195,12 @@ impl WifiManager {
             }
             std::thread::sleep(SCAN_READ_GAP);
         }
-        let summary: Vec<String> = merged
-            .iter()
-            .map(|s| format!("{} ({}dBm)", s.ssid, s.rssi))
-            .collect();
-        log::info!(
-            "blufi: scan returned {} wifi network(s): [{}]",
-            merged.len(),
-            summary.join(", ")
-        );
         Ok(merged)
+    }
+
+    /// 当前是否已关联到 AP（用于判断是否需要临时断开再扫描）。
+    fn is_connected(&self) -> bool {
+        matches!(self.status(), Ok(WifiStatus::Connected { .. }))
     }
 
     /// 仅触发一次扫描（`wpa_cli scan`），**不等结果、不读 `scan_results`**。
