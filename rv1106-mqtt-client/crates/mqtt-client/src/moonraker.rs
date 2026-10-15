@@ -101,12 +101,30 @@ impl MoonrakerClient {
         let msg = Message::text(text);
         loop {
             match ws.write(msg.clone()) {
-                Ok(()) => return Ok(()),
+                Ok(()) => break,
                 Err(WsError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(2));
                 }
                 Err(WsError::Io(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(format!("write: {e}")),
+            }
+        }
+        self.flush()
+    }
+
+    /// tungstenite 0.26 默认 write_buffer_size=128KB：小帧只入内部缓冲、不落 socket，
+    /// 必须显式 flush。否则请求与自动应答的 Pong 全部滞留 —— Moonraker 每 10s Ping
+    /// 收不到 Pong，30s ping 超时踢连接，表现为「连接上但无任何响应/数据」。
+    fn flush(&mut self) -> Result<(), String> {
+        let ws = self.ws.as_mut().ok_or_else(|| "not connected".to_string())?;
+        loop {
+            match ws.flush() {
+                Ok(()) => return Ok(()),
+                Err(WsError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(WsError::Io(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(format!("flush: {e}")),
             }
         }
     }
@@ -116,8 +134,11 @@ impl MoonrakerClient {
         let ws = self.ws.as_mut().ok_or_else(|| "not connected".to_string())?;
         match ws.read() {
             Ok(Message::Text(t)) => Ok(Some(t.as_str().to_string())),
-            Ok(Message::Ping(p)) => {
-                let _ = ws.write(Message::Pong(p));
+            Ok(Message::Ping(_)) => {
+                // read() 已自动排队 Pong，flush 将其送出（不回应答会被 Moonraker 踢）
+                if let Err(e) = ws.flush() {
+                    log::warn!("moonraker pong flush: {e}");
+                }
                 Ok(None)
             }
             Ok(Message::Pong(_)) => Ok(None),
@@ -167,7 +188,16 @@ pub struct MoonrakerWorker {
     event_tx: mpsc::Sender<Event>,
     client: MoonrakerClient,
     pending: HashMap<u64, mpsc::Sender<Result<Value, String>>>,
+    /// 内部请求（objects.list/subscribe）id：与 MrHandle 的 id 空间隔离（≥1e6），
+    /// 避免与 dispatcher 并发请求的 pending 条目冲突。
+    internal_next_id: u64,
+    /// 待回包的 objects.list / objects.subscribe 响应接收端。
+    pending_list: Option<mpsc::Receiver<Result<Value, String>>>,
+    pending_sub: Option<mpsc::Receiver<Result<Value, String>>>,
 }
+
+/// 内部请求 id 基址（MrHandle 从 1 起计数，二者不相交）。
+const INTERNAL_ID_BASE: u64 = 1_000_000;
 
 impl MoonrakerWorker {
     pub fn spawn(cfg: MoonrakerConfig, state: Arc<Mutex<AppState>>, event_tx: mpsc::Sender<Event>) -> MrHandle {
@@ -179,6 +209,9 @@ impl MoonrakerWorker {
             event_tx,
             client: MoonrakerClient::new(&cfg),
             pending: HashMap::new(),
+            internal_next_id: INTERNAL_ID_BASE,
+            pending_list: None,
+            pending_sub: None,
         };
         std::thread::Builder::new()
             .name("moonraker".into())
@@ -225,6 +258,9 @@ impl MoonrakerWorker {
                     let _ = self.event_tx.send(Event::MrDisconnected);
                 }
             }
+
+            // 2.5 内部订阅流程：objects.list → 订阅交集 → 应用初始状态
+            self.poll_internal();
 
             // 3. 心跳：每 ~10s 一次 server.info（保活 + 探活；id=0 不参与响应关联）
             beat_counter += 1;
@@ -281,6 +317,12 @@ impl MoonrakerWorker {
                         None => Err(resp.error.map(|e| e.to_string()).unwrap_or_else(|| "no result".into())),
                     };
                     let _ = tx.send(r);
+                    return;
+                }
+                // 未关联响应（id=0 心跳 / 重连前遗留请求）：错误不得静默丢弃，
+                // 否则订阅失败等问题完全无迹可循。
+                if let Some(err) = &resp.error {
+                    log::warn!("moonraker rpc error (id={id}): {err}");
                 }
                 return;
             }
@@ -316,28 +358,110 @@ impl MoonrakerWorker {
     }
 
     fn after_connect(&mut self) {
-        // 订阅对象状态：fire-and-forget（id=0，响应不参与关联；handle_frame 在 pending
-        // 中查不到 0 会直接丢弃，这是预期的）。Moonraker 收到即生效，且首条
-        // notify_status_update 会立即回带订阅对象的全量状态。
+        // 两步订阅：先 `printer.objects.list` 查实际存在的对象，再对交集发起订阅。
         //
-        // 因此不再单独发一次 id=0 的 `printer.objects.query` 全量查询：其响应同样因
-        // pending 无 0 被静默丢弃，纯属无效请求（旧注释「补齐订阅通知外的状态」是谎言）。
-        let sub = RpcRequest {
-            id: 0,
-            jsonrpc: "2.0",
-            method: "printer.objects.subscribe".into(),
-            params: json!({ "objects": SUBSCRIBE_OBJECTS }),
-        };
-        if let Ok(t) = serde_json::to_string(&sub) {
-            let _ = self.client.send_text(&t);
-        }
+        // 不能直接订阅固定清单：Klipper 对含任一未知对象的订阅请求会整体报错
+        // （heater_fan/output_pin/led/runout_sensor 是带后缀的多实例对象，裸名在
+        // 多数 printer.cfg 中并不存在），而订阅帧 id=0 的错误响应此前被静默丢弃
+        // —— 表现为永远收不到 notify_status_update，app 端温度/风扇恒 0。
         self.state.lock().unwrap().moonraker_connected = true;
+        self.pending_list = Some(self.internal_request("printer.objects.list", json!({})));
+    }
+
+    /// 发送内部请求（id 与 MrHandle 隔离）；发送失败时返回已断开的接收端，
+    /// poll_internal 视为失败并放弃本轮订阅（重连后重试）。
+    fn internal_request(&mut self, method: &str, params: Value) -> mpsc::Receiver<Result<Value, String>> {
+        self.internal_next_id += 1;
+        let id = self.internal_next_id;
+        let (tx, rx) = mpsc::channel();
+        let frame = serde_json::to_string(&RpcRequest { id, jsonrpc: "2.0", method: method.into(), params });
+        match frame {
+            Ok(t) => {
+                if let Err(e) = self.client.send_text(&t) {
+                    log::warn!("moonraker {method} send failed: {e}");
+                } else {
+                    self.pending.insert(id, tx);
+                }
+            }
+            Err(e) => log::warn!("moonraker {method} serialize failed: {e}"),
+        }
+        rx
+    }
+
+    /// 轮询内部请求回包：list → 订阅交集；subscribe → 应用初始状态。
+    fn poll_internal(&mut self) {
+        if let Some(rx) = self.pending_list.take() {
+            match rx.try_recv() {
+                Ok(Ok(v)) => self.subscribe_objects(subscription_subset(&v)),
+                Ok(Err(e)) => log::warn!("moonraker objects.list error: {e}"),
+                Err(mpsc::TryRecvError::Disconnected) => log::warn!("moonraker objects.list: no reply"),
+                Err(mpsc::TryRecvError::Empty) => self.pending_list = Some(rx),
+            }
+        }
+        if let Some(rx) = self.pending_sub.take() {
+            match rx.try_recv() {
+                Ok(Ok(v)) => self.apply_initial_status(&v),
+                Ok(Err(e)) => log::warn!("moonraker subscribe error: {e}"),
+                Err(mpsc::TryRecvError::Disconnected) => log::warn!("moonraker subscribe: no reply"),
+                Err(mpsc::TryRecvError::Empty) => self.pending_sub = Some(rx),
+            }
+        }
+    }
+
+    fn subscribe_objects(&mut self, objs: Vec<String>) {
+        if objs.is_empty() {
+            log::warn!("moonraker: no known object to subscribe");
+            return;
+        }
+        log::info!("moonraker: subscribing {} objects: {objs:?}", objs.len());
+        // Klipper 要求 objects 为字典 {对象名: null}；传数组会报
+        // "dictionary update sequence element #0 has length N; 2 is required"。
+        let objects: serde_json::Map<String, Value> =
+            objs.into_iter().map(|o| (o, Value::Null)).collect();
+        self.pending_sub = Some(self.internal_request(
+            "printer.objects.subscribe",
+            json!({ "objects": objects }),
+        ));
+    }
+
+    /// 订阅响应携带订阅对象的全量初始状态：写入 AppState 并通知模块立即上报。
+    fn apply_initial_status(&mut self, result: &Value) {
+        let Some(status) = result.get("status").and_then(Value::as_object) else { return };
+        log::info!("moonraker: initial status {} objects", status.len());
+        {
+            let mut s = self.state.lock().unwrap();
+            state_bridge::apply(&mut s, status);
+        }
+        let _ = self.event_tx.send(Event::StatusUpdated);
     }
 }
 
 // ---------------------------------------------------------------------------
 // state_bridge：notify_status_update → AppState
 // ---------------------------------------------------------------------------
+
+/// 取对象名首词：Klipper 多实例对象带后缀（如 "heater_fan xxx"），
+/// 订阅与状态归类均按首词进行。
+fn first_word(name: &str) -> &str {
+    name.split(' ').next().unwrap_or(name)
+}
+
+/// 从 `printer.objects.list` 结果中筛出可订阅对象：对象名精确命中或首词命中
+/// SUBSCRIBE_OBJECTS（如 "heater_fan main_fan" → 首词 heater_fan）。返回实际
+/// 存在的对象名——订阅裸名 "heater_fan" 在 Klipper 中同样会被整体拒绝。
+fn subscription_subset(list_result: &Value) -> Vec<String> {
+    list_result
+        .get("objects")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .filter(|name| SUBSCRIBE_OBJECTS.contains(&first_word(name)))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 pub mod state_bridge {
     use super::*;
@@ -346,7 +470,8 @@ pub mod state_bridge {
     pub fn apply(s: &mut AppState, map: &Map<String, Value>) {
         for (obj, v) in map {
             let Some(attrs) = v.as_object() else { continue };
-            match obj.as_str() {
+            // 按首词归类，兼容 "heater_fan xxx" 等带后缀对象名
+            match first_word(obj) {
                 "extruder" => {
                     num(attrs, "temperature", &mut s.nozzle_actual);
                     num(attrs, "target", &mut s.nozzle_target);
@@ -454,8 +579,34 @@ pub mod state_bridge {
 #[cfg(test)]
 mod tests {
     use super::state_bridge;
+    use super::subscription_subset;
     use crate::app_state::AppState;
     use serde_json::json;
+
+    /// 订阅对象须按 objects.list 交集筛选：不存在对象会导致整个订阅被 Klipper 拒绝。
+    #[test]
+    fn subscription_subset_filters_unknown_objects() {
+        let list = json!({
+            "objects": ["extruder", "heater_bed", "fan", "heater_fan main_fan",
+                        "print_stats", "gcode_move", "virtual_sdcard", "configfile",
+                        "output_pin light", "bed_mesh"]
+        });
+        let subs = subscription_subset(&list);
+        for must in ["extruder", "heater_bed", "fan", "heater_fan main_fan", "output_pin light", "bed_mesh"] {
+            assert!(subs.iter().any(|s| s == must), "missing {must}");
+        }
+        assert!(!subs.iter().any(|s| s == "led"), "不存在的裸名应被剔除");
+        assert!(!subs.iter().any(|s| s == "runout_sensor"));
+    }
+
+    /// 回归：带后缀对象名（"heater_fan xxx"）也应归入风扇状态。
+    #[test]
+    fn bridge_matches_prefixed_heater_fan() {
+        let mut s = AppState::default();
+        let map = json!({ "heater_fan board_fan": {"speed": 0.5} });
+        state_bridge::apply(&mut s, map.as_object().unwrap());
+        assert_eq!(s.board_fan_pct, 50);
+    }
 
     #[test]
     fn bridge_applies_temps_and_print() {

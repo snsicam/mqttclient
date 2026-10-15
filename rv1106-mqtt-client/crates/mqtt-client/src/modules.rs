@@ -25,6 +25,8 @@ const UPLINK_FIFO_CAP: usize = 10;
 const TICK_INTERVAL: Duration = Duration::from_millis(500);
 const STATUS_IDLE_INTERVAL_SECS: u64 = 5 * 60;
 const STATUS_BUSY_INTERVAL_SECS: u64 = 10;
+/// 状态脏标记发布限流：Moonraker 温度通知可能 ~1s 一条，避免状态包风暴。
+const DIRTY_PUBLISH_MIN_INTERVAL_SECS: u64 = 3;
 
 // ---------------------------------------------------------------------------
 // 8 个业务子模块（各持有自身状态）
@@ -279,6 +281,8 @@ impl AppModule {
                 // 协议：bindState 0=已绑定 / 1=未绑定 / 2=序列号未录入（与 ConnStateMachine::bound 一致）
                 if bind == 0 {
                     log::info!("login ok, bound");
+                    // 绑定成功立即上报一次状态包（dirty），force_publish 仅驱动快速 tick
+                    self.mods.status.dirty = true;
                     self.force_publish = true;
                 } else {
                     // 0 以外均视为未完成绑定：不上报状态，等待平台侧录入/绑定
@@ -286,6 +290,9 @@ impl AppModule {
                 }
             }
             "status_query" => {
+                // 立即发布状态包（on_tick 消费 dirty）；仅置 force_publish 不够——
+                // 状态包只在心跳/周期分支发布，app 打开后会一直看到 0。
+                self.mods.status.dirty = true;
                 self.force_publish = true;
             }
             "gcode" => {
@@ -459,6 +466,20 @@ impl MqttModule for AppModule {
             }
         }
 
+        // 2.7 状态脏标记 → 立即发布状态包：status_query / StatusUpdated / 绑定成功触发。
+        //     限流 DIRTY_PUBLISH_MIN_INTERVAL_SECS，防止 Moonraker 高频通知造成状态包风暴；
+        //     限流期间保留 dirty，下一 tick 重试。
+        if self.mods.status.dirty
+            && self.conn.state == ConnState::Ready
+            && self.conn.bound
+            && now.saturating_sub(self.conn.last_status_publish_ts) >= DIRTY_PUBLISH_MIN_INTERVAL_SECS
+        {
+            self.mods.status.dirty = false;
+            log::info!("status dirty: publish status packs now");
+            self.publish_status_packs(outbox);
+            self.conn.last_status_publish_ts = now;
+        }
+
         // 3. 心跳：已 login（Ready 且 bound）且 3min 无下行 → 状态上报。
         //    未 login（连接已建立但 login 回复未达 / 未绑定）不报状态包，
         //    必须先完成 login 才允许上报（对齐 FIFO/周期上报的 bound 守卫）。
@@ -589,6 +610,22 @@ mod tests {
         let msg = DownlinkMsg::parse(br#"{"type":"status_query"}"#).unwrap();
         m.handle_downlink(&msg);
         assert!(m.force_publish);
+        assert!(m.mods.status.dirty);
+    }
+
+    /// 回归：status_query 下行应立即发布 4 个状态包。此前仅置 force_publish
+    /// （运行时从不消费），状态包只在 3min 心跳 / 忙10s·闲5min 周期发布，
+    /// app 打开后会一直显示 0。
+    #[test]
+    fn status_query_publishes_status_packs_now() {
+        let (mut m, _tx) = test_module();
+        m.handle_downlink(&DownlinkMsg::parse(br#"{"type":"login","bindState":0}"#).unwrap());
+        m.handle_downlink(&DownlinkMsg::parse(br#"{"type":"status_query"}"#).unwrap());
+        assert!(m.mods.status.dirty);
+        let mut outbox = Recorder::default();
+        m.on_tick(&mut outbox);
+        assert_eq!(outbox.items.len(), 4, "应立即发布 4 个状态包");
+        assert!(!m.mods.status.dirty, "发布后应清除脏标记");
     }
 
     #[test]
