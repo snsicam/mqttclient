@@ -11,7 +11,7 @@
 //!
 //! 广播名由调用方按规则生成后传入：`{model}-{device.id}`（例如 `M1S-Ge33700a6620dfddc`），
 //! 其中 `model` 来自配置 `[mqtt] model`、`device.id` 来自板载序列号
-//!（`config.rs::device_id_from_serial()`，前缀 `G`）。本模块**不**读取
+//!（`config.rs::device_id_from_serial()`，`G` + 12 位数字）。本模块**不**读取
 //! `Adapter::alias()` / `main.conf` `Name` / `system_name()` —— 这些要么是被内核截成
 //! 10 字节的主机名（`M1S-Ge3370`），要么与「module + 设备 id」规则无关。bluer 的
 //! `local_name` 把名字交给 BlueZ 写进 scan response（Complete Local Name，31 字节

@@ -143,7 +143,8 @@ fn main() {
             std::process::exit(1);
         })
     };
-    // device.id 自动填充：配置为占位值时，从板载序列号读取（`G` + `/proc/cpuinfo Serial`），
+    // device.id 自动填充：配置为占位值时，从板载序列号读取（`/proc/cpuinfo` Serial
+    // 前后各 8 位 u32 相加，前缀 "10" + 补零到 10 位，见 `device_id_from_serial`），
     // 并回写配置文件，便于后续启动直接使用真实 id。
     if cfg.device.id.is_empty() || cfg.device.id == PLACEHOLDER_DEVICE_ID {
         if let Some(serial) = read_board_serial() {

@@ -1,9 +1,10 @@
 # RV1106 MQTT 客户端配置（对应 LLD-003 §9）
 
 [device]
-# 设备 ID：G + 板载序列号（/proc/cpuinfo Serial，如 Ge33700a6620dfddc，构成 topic：GT/MXS/UP/{id}）。
-# 若保持占位值 G000000000000，启动时自动用板载序列号生成并回写。
-id = "G000000000000"
+# 设备 ID：G + 序列号。序列号由板载序列号（/proc/cpuinfo Serial）前后各 8 位 u32 相加得 num，
+# 拼前缀 "10" 并补零到 10 位（共 12 位数字，如 G102732598375，构成 topic：GT/MXS/UP/{id}）。
+# 若保持占位值 G100000000000，启动时自动用板载序列号生成并回写。
+id = "G100000000000"
 # 主板型号版本
 mb = "MOTHERBOARD_V1.0"
 # MCU 软件版本
@@ -18,15 +19,15 @@ lang = 0
 [mqtt]
 # 设备型号：构成 topic GT/{model}/UP|DOWN|LWT/{deviceId}（默认 M1S）
 model = "M1S"
-broker = "121.199.168.145"
+broker = "124.221.175.240"
 port = 1883
 # 心跳（秒），MXS 协议要求 60
 keepalive_secs = 60
 # Clean Session=0：保持会话，重连后可收到离线 QoS1 消息
 clean_session = false
 # 认证（可选）
-# username 默认 = 设备 id（G+序列号，动态生成）；如需固定账号可显式覆盖：
-# username = "Ge33700a6620dfddc"
+# username 默认 = 设备 id（G+12 位数字序列号，动态生成）；如需固定账号可显式覆盖：
+# username = "G102732598375"
 # password = "secret"
 
 [moonraker]

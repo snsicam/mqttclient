@@ -35,8 +35,8 @@ impl Default for AppConfig {
     }
 }
 
-/// 占位设备 ID：读不到板载序列号时的兜底值。
-pub const PLACEHOLDER_DEVICE_ID: &str = "G000000000000";
+/// 占位设备 ID：读不到板载序列号时的兜底值（`G` + `"10"` + 10 位 0，共 13 字符）。
+pub const PLACEHOLDER_DEVICE_ID: &str = "G100000000000";
 
 /// 设备型号常量定义宏。
 ///
@@ -94,9 +94,17 @@ pub fn read_board_serial() -> Option<String> {
     None
 }
 
-/// 由板载序列号生成设备 ID：`G` + 序列号（如 `Ge33700a6620dfddc`）。
+/// 由板载序列号生成设备 ID：`G` + 12 位数字序列号（共 13 字符）。
+///
+/// 序列号算法：原 16 位十六进制序列号拆成前后各 8 位，按 u32 相加（回绕）得 num，
+/// 再格式化为 `"10"` 前缀 + 10 位十进制（不足补零），等价于 C 侧
+/// `sprintf(sn, "10%010d", num)`；`"10"` 前缀保证首位非 0，num 无需再置位。
+/// 如 `1234567890ABCDEF` → 0x12345678 + 0x90ABCDEF = 2732598375 → `G102732598375`。
 pub fn device_id_from_serial(serial: &str) -> String {
-    format!("G{}", serial.trim())
+    let s = serial.trim();
+    let hi = u32::from_str_radix(s.get(..8).unwrap_or(""), 16).unwrap_or(0);
+    let lo = u32::from_str_radix(s.get(8..16).unwrap_or(""), 16).unwrap_or(0);
+    format!("G10{:010}", hi.wrapping_add(lo))
 }
 
 /// 默认设备 ID：优先取板载序列号，读不到则退回占位符。
@@ -108,7 +116,7 @@ pub fn default_device_id() -> String {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DeviceConfig {
-    /// 设备 ID，格式 `G{序列号}`（默认自动取板载序列号），构成 topic 的一部分。
+    /// 设备 ID，格式 `G` + 12 位数字序列号（默认由板载序列号经 `device_id_from_serial` 生成），构成 topic 的一部分。
     pub id: String,
     /// 主板型号版本。
     pub mb: String,
@@ -399,12 +407,17 @@ port = 7125
 
     #[test]
     fn device_id_from_serial_ok() {
-        assert_eq!(device_id_from_serial("e33700a6620dfddc"), "Ge33700a6620dfddc");
-        assert_eq!(device_id_from_serial(" e33700a6620dfddc "), "Ge33700a6620dfddc");
-        // 默认 id 以 G 开头且非空（读不到序列号时退回占位符，仍满足校验）
+        // 1234567890ABCDEF → 0x12345678+0x90ABCDEF=2732598375 → "10"+10 位
+        assert_eq!(device_id_from_serial("1234567890ABCDEF"), "G102732598375");
+        // e33700a6620dfddc → 0xe33700a6+0x620dfddc=0x14544FE82（回绕 0x4544FE82=1162149506）
+        assert_eq!(device_id_from_serial("e33700a6620dfddc"), "G101162149506");
+        assert_eq!(device_id_from_serial(" e33700a6620dfddc "), "G101162149506");
+        // 默认 id：`G` + "10" + 10 位数字（读不到序列号时退回占位符，仍满足校验）
         let id = default_device_id();
-        assert!(id.starts_with('G') && id.len() >= 2);
-        assert!(id.len() <= 64);
+        assert!(id.starts_with("G10"));
+        let serial = &id[1..];
+        assert_eq!(serial.len(), 12);
+        assert!(serial.chars().all(|c| c.is_ascii_digit()));
     }
 
     #[test]
