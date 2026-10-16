@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -160,7 +160,8 @@ pub struct MrCommand {
     pub id: u64,
     pub method: String,
     pub params: Value,
-    pub resp: mpsc::Sender<Result<Value, String>>,
+    /// 响应回传端：`None` 表示 fire-and-forget（不注册 pending，响应按未知 id 丢弃）。
+    pub resp: Option<mpsc::Sender<Result<Value, String>>>,
 }
 
 /// dispatcher 使用的同步命令句柄。
@@ -176,9 +177,19 @@ impl MrHandle {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
         self.cmd_tx
-            .send(MrCommand { id, method: method.into(), params, resp: tx })
+            .send(MrCommand { id, method: method.into(), params, resp: Some(tx) })
             .map_err(|_| "moonraker worker stopped".to_string())?;
         rx.recv_timeout(timeout).map_err(|_| format!("moonraker timeout: {method}"))?
+    }
+
+    /// 发起请求但不等待响应（fire-and-forget）：仅保证请求已提交/写入 websocket，
+    /// 响应按未知 id 丢弃。用于长耗时命令（如 BED_MESH_CALIBRATE）——结果经
+    /// 状态通知上报，不能阻塞应答。
+    pub fn request_no_wait(&self, method: &str, params: Value) -> Result<(), String> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.cmd_tx
+            .send(MrCommand { id, method: method.into(), params, resp: None })
+            .map_err(|_| "moonraker worker stopped".to_string())
     }
 }
 
@@ -194,10 +205,20 @@ pub struct MoonrakerWorker {
     /// 待回包的 objects.list / objects.subscribe 响应接收端。
     pending_list: Option<mpsc::Receiver<Result<Value, String>>>,
     pending_sub: Option<mpsc::Receiver<Result<Value, String>>>,
+    /// 订阅流程失败后的下次重试时刻（None=无需重试）。
+    sub_retry_at: Option<Instant>,
 }
 
 /// 内部请求 id 基址（MrHandle 从 1 起计数，二者不相交）。
 const INTERNAL_ID_BASE: u64 = 1_000_000;
+
+/// 订阅流程失败后的重试间隔。
+const SUB_RETRY_INTERVAL: Duration = Duration::from_secs(3);
+
+/// 每轮循环最多排空的 WS 帧数（防止对端洪泛时饿死循环其余逻辑）。
+/// 打印进行中 notify_status_update 随每行 gcode 推送，速率远超单帧轮询吞吐，
+/// 不排空会导致 TCP 缓冲积压、状态上报滞后可达分钟级。
+const WS_DRAIN_MAX_FRAMES: usize = 200;
 
 impl MoonrakerWorker {
     pub fn spawn(cfg: MoonrakerConfig, state: Arc<Mutex<AppState>>, event_tx: mpsc::Sender<Event>) -> MrHandle {
@@ -212,6 +233,7 @@ impl MoonrakerWorker {
             internal_next_id: INTERNAL_ID_BASE,
             pending_list: None,
             pending_sub: None,
+            sub_retry_at: None,
         };
         std::thread::Builder::new()
             .name("moonraker".into())
@@ -247,20 +269,33 @@ impl MoonrakerWorker {
                 self.send_request(c);
             }
 
-            // 2. 非阻塞读
-            match self.client.read_text() {
-                Ok(Some(text)) => self.handle_frame(&text),
-                Ok(None) => {}
-                Err(e) => {
-                    log::warn!("moonraker read error: {e}");
-                    self.client.close();
-                    self.state.lock().unwrap().moonraker_connected = false;
-                    let _ = self.event_tx.send(Event::MrDisconnected);
+            // 2. 非阻塞读：排空 socket 内已就绪的全部帧（上限 WS_DRAIN_MAX_FRAMES）
+            for _ in 0..WS_DRAIN_MAX_FRAMES {
+                match self.client.read_text() {
+                    Ok(Some(text)) => self.handle_frame(&text),
+                    Ok(None) => break,
+                    Err(e) => {
+                        log::warn!("moonraker read error: {e}");
+                        self.client.close();
+                        self.state.lock().unwrap().moonraker_connected = false;
+                        let _ = self.event_tx.send(Event::MrDisconnected);
+                        break;
+                    }
                 }
             }
 
-            // 2.5 内部订阅流程：objects.list → 订阅交集 → 应用初始状态
+            // 2.5 内部订阅流程：objects.list → 订阅交集 → 应用初始状态。
+            // 失败（如 Klippy 尚未就绪时 objects.list 报 -32601 Method not found）
+            // 不再放弃，按 SUB_RETRY_INTERVAL 退避重试，直至订阅成功。
             self.poll_internal();
+            if let Some(t) = self.sub_retry_at {
+                if Instant::now() >= t {
+                    self.sub_retry_at = None;
+                    log::info!("moonraker: retrying subscription flow");
+                    self.pending_list =
+                        Some(self.internal_request("printer.objects.list", json!({})));
+                }
+            }
 
             // 3. 心跳：每 ~10s 一次 server.info（保活 + 探活；id=0 不参与响应关联）
             beat_counter += 1;
@@ -295,14 +330,22 @@ impl MoonrakerWorker {
         match text {
             Ok(t) => match self.client.send_text(&t) {
                 Ok(()) => {
-                    self.pending.insert(c.id, c.resp);
+                    if let Some(tx) = c.resp {
+                        self.pending.insert(c.id, tx);
+                    }
                 }
                 Err(e) => {
-                    let _ = c.resp.send(Err(e));
+                    if let Some(tx) = c.resp {
+                        let _ = tx.send(Err(e));
+                    } else {
+                        log::warn!("moonraker rpc (no-wait) send failed: {e}");
+                    }
                 }
             },
             Err(e) => {
-                let _ = c.resp.send(Err(e.to_string()));
+                if let Some(tx) = c.resp {
+                    let _ = tx.send(Err(e.to_string()));
+                }
             }
         }
     }
@@ -345,13 +388,45 @@ impl MoonrakerWorker {
             }
             "notify_klippy_ready" => {
                 self.state.lock().unwrap().moonraker_connected = true;
+                // Klippy 就绪（含晚于本连接启动、FIRMWARE_RESTART 重启的场景）：
+                // klippy 方法此刻才可用，重建订阅流程以恢复 notify_status_update。
+                self.sub_retry_at = None;
+                self.pending_sub = None;
+                self.pending_list =
+                    Some(self.internal_request("printer.objects.list", json!({})));
                 let _ = self.event_tx.send(Event::MrConnected);
             }
             "notify_klippy_disconnected" => {
-                self.state.lock().unwrap().moonraker_connected = false;
+                {
+                    let mut s = self.state.lock().unwrap();
+                    // 调平中 Klippy 掉线视为调平失败（对齐 Marlin G29_RETURN 失败分支）。
+                    if s.leveling_status == 1 {
+                        s.leveling_status = 3;
+                    }
+                    s.moonraker_connected = false;
+                }
                 let _ = self.event_tx.send(Event::MrDisconnected);
             }
-            "notify_gcode_response" => { /* gcode 结果走 RPC 响应，忽略 */ }
+            "notify_gcode_response" => {
+                // 调平结束检测（对齐 Marlin G29_RETURN 结束即推 status_level）：
+                // - 成功：Klipper 输出 "Mesh Bed Leveling Complete"（extras/bed_mesh.py:786）
+                // - 失败：`!!` 前缀错误响应（探针异常等）
+                if let Some(params) = &n.params {
+                    if let Some(resp) = params.get(0).and_then(Value::as_str) {
+                        let mut s = self.state.lock().unwrap();
+                        if resp.contains("Mesh Bed Leveling Complete") {
+                            s.leveling_status = 2;
+                            s.leveling_point = s.leveling_total;
+                            drop(s);
+                            let _ = self.event_tx.send(Event::StatusUpdated);
+                        } else if resp.starts_with("!!") && s.leveling_status == 1 {
+                            s.leveling_status = 3;
+                            drop(s);
+                            let _ = self.event_tx.send(Event::StatusUpdated);
+                        }
+                    }
+                }
+            }
             "notify_filelist_changed" => { /* file_list 用 RPC 查询，忽略 */ }
             _ => {}
         }
@@ -365,6 +440,9 @@ impl MoonrakerWorker {
         // 多数 printer.cfg 中并不存在），而订阅帧 id=0 的错误响应此前被静默丢弃
         // —— 表现为永远收不到 notify_status_update，app 端温度/风扇恒 0。
         self.state.lock().unwrap().moonraker_connected = true;
+        // Klippy 可能晚于 Moonraker 就绪：此时 klippy 方法未注册，objects.list
+        // 返回 -32601。失败由 poll_internal 安排退避重试。
+        self.sub_retry_at = None;
         self.pending_list = Some(self.internal_request("printer.objects.list", json!({})));
     }
 
@@ -393,16 +471,30 @@ impl MoonrakerWorker {
         if let Some(rx) = self.pending_list.take() {
             match rx.try_recv() {
                 Ok(Ok(v)) => self.subscribe_objects(subscription_subset(&v)),
-                Ok(Err(e)) => log::warn!("moonraker objects.list error: {e}"),
-                Err(mpsc::TryRecvError::Disconnected) => log::warn!("moonraker objects.list: no reply"),
+                Ok(Err(e)) => {
+                    // 典型场景：Moonraker 已连但 Klippy 未就绪 → klippy 方法未注册，
+                    // 返回 -32601 "Method not found"。退避重试直至成功。
+                    log::warn!("moonraker objects.list error: {e} (retry in 3s)");
+                    self.sub_retry_at = Some(Instant::now() + SUB_RETRY_INTERVAL);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    log::warn!("moonraker objects.list: no reply (retry in 3s)");
+                    self.sub_retry_at = Some(Instant::now() + SUB_RETRY_INTERVAL);
+                }
                 Err(mpsc::TryRecvError::Empty) => self.pending_list = Some(rx),
             }
         }
         if let Some(rx) = self.pending_sub.take() {
             match rx.try_recv() {
                 Ok(Ok(v)) => self.apply_initial_status(&v),
-                Ok(Err(e)) => log::warn!("moonraker subscribe error: {e}"),
-                Err(mpsc::TryRecvError::Disconnected) => log::warn!("moonraker subscribe: no reply"),
+                Ok(Err(e)) => {
+                    log::warn!("moonraker subscribe error: {e} (restart flow in 3s)");
+                    self.sub_retry_at = Some(Instant::now() + SUB_RETRY_INTERVAL);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    log::warn!("moonraker subscribe: no reply (restart flow in 3s)");
+                    self.sub_retry_at = Some(Instant::now() + SUB_RETRY_INTERVAL);
+                }
                 Err(mpsc::TryRecvError::Empty) => self.pending_sub = Some(rx),
             }
         }
@@ -549,8 +641,25 @@ pub mod state_bridge {
                     }
                 }
                 "bed_mesh" => {
-                    if let Some(profiles) = attrs.get("profiles").and_then(Value::as_array) {
-                        s.level_ok = !profiles.is_empty();
+                    // level（status_hardware）= 网格有效，对齐 Marlin `leveling_is_valid()`：
+                    // 活动网格（BED_MESH_CALIBRATE 完成即生效，无需保存 profile）或已保存
+                    // profile；`probed_matrix` 为空（[[]]，如 BED_MESH_CLEAR 后）→ 仅看 profiles。
+                    // 注意：Klipper 的 profiles 是字典（如 {"default": {...}}），非数组。
+                    let profiles_non_empty = attrs.get("profiles").map(|p| match p {
+                        Value::Array(a) => !a.is_empty(),
+                        Value::Object(o) => !o.is_empty(),
+                        _ => false,
+                    });
+                    if let Some(pm) = attrs.get("probed_matrix").and_then(Value::as_array) {
+                        let cols = pm.first().and_then(Value::as_array).map(|r| r.len()).unwrap_or(0);
+                        let mesh_active = !pm.is_empty() && cols > 0;
+                        s.level_ok = mesh_active || profiles_non_empty.unwrap_or(s.level_ok);
+                        // 探测点阵（如 5×5）→ 调平总点数（status_level.levelingTotalPoints）
+                        if mesh_active {
+                            s.leveling_total = ((pm.len() * cols).min(255)) as u8;
+                        }
+                    } else if let Some(pe) = profiles_non_empty {
+                        s.level_ok = pe;
                     }
                 }
                 _ => {}
@@ -634,13 +743,34 @@ mod tests {
         let mut s = AppState::default();
         let map = json!({
             "runout_sensor": {"sensor": {"runout": true, "enabled": true}},
-            "bed_mesh": {"profiles": ["default"]},
+            "bed_mesh": {"profiles": {"default": {}}, "probed_matrix": [[0.1, 0.2], [0.3, 0.4]]},
             "gcode_move": {"homing_origin": [0.0, 0.0, -0.15]},
         });
         state_bridge::apply(&mut s, map.as_object().unwrap());
         assert!(s.runout);
         assert!(s.level_ok);
+        assert_eq!(s.leveling_total, 4, "2×2 探测矩阵 → 总点数 4");
         assert_eq!(s.zoffset_x100, -15);
+    }
+
+    /// level 语义对齐 Marlin leveling_is_valid()：校准完成即有活动网格（无需保存
+    /// profile）；无网格时 level 仅由已保存 profiles 决定。
+    #[test]
+    fn bridge_mesh_valid_without_saved_profile() {
+        let mut s = AppState::default();
+        // 校准完成：有活动网格、无保存 profile → level=1
+        let calibrated = json!({
+            "bed_mesh": {"profile_name": null, "profiles": {},
+                         "probed_matrix": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]}
+        });
+        state_bridge::apply(&mut s, calibrated.as_object().unwrap());
+        assert!(s.level_ok, "活动网格即视为已调平");
+        assert_eq!(s.leveling_total, 9);
+
+        // BED_MESH_CLEAR 后：probed_matrix=[[]]、无 profile → level=0
+        let cleared = json!({ "bed_mesh": {"profile_name": "", "profiles": {}, "probed_matrix": [[]]} });
+        state_bridge::apply(&mut s, cleared.as_object().unwrap());
+        assert!(!s.level_ok, "网格清除且无 profile 应视为未调平");
     }
 
     #[test]
