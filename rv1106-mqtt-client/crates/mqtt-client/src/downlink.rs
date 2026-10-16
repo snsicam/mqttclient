@@ -279,6 +279,11 @@ impl Dispatcher {
     /// 流式写入磁盘：按 `download.chunk_size` 分块读取并边读边落盘，同时在读取过程中累加校验
     /// 总量，超过 `max_file_bytes` 立即中止并删除残留文件。避免「先整文件读进内存再校验 512MB」
     /// 导致大文件撑爆内存；也让配置项 `chunk_size` 真正生效。
+    ///
+    /// 原子落盘：先写 `<name>.part`（Moonraker 按扩展名过滤不会发现），成功后同目录
+    /// `rename` 到终名（POSIX 原子）——进程崩溃/断电只残留 `.part`，不会把半截 gcode
+    /// 留进打印列表。写入前拒绝覆盖**打印中**的同名 gcode（截断会让 virtual_sdcard 读到
+    /// EOF，打印提前终止）。
     fn download(&mut self, file_type: u8, file_name: &str, url: Option<&str>, _server_ip: Option<&str>) -> (u8, Option<String>) {
         let Some(url) = url.filter(|u| !u.is_empty()) else {
             return (1, None);
@@ -313,6 +318,14 @@ impl Dispatcher {
             return (2, None);
         }
         let dest = std::path::Path::new(&dir).join(&safe);
+        let dest_part = std::path::Path::new(&dir).join(format!("{safe}.part"));
+
+        // gcode：同名文件打印中则拒绝（File::create 截断会让 virtual_sdcard 读到 EOF，
+        // 打印提前终止）。err_code=1（忙）。
+        if is_gcode && self.printing_file_is(&safe) {
+            log::warn!("download: {safe} 正在打印中，拒绝覆盖");
+            return (1, None);
+        }
 
         // ureq 3.x：超时通过 Config + Agent 设置（无 RequestBuilder::timeout）
         let config = ureq::config::Config::builder()
@@ -330,10 +343,10 @@ impl Dispatcher {
         let max_bytes = self.cfg.download.max_file_bytes;
         let mut reader = resp.body_mut().as_reader();
         let mut buf = vec![0u8; self.cfg.download.chunk_size.max(1)];
-        let mut file = match std::fs::File::create(&dest) {
+        let mut file = match std::fs::File::create(&dest_part) {
             Ok(f) => f,
             Err(e) => {
-                log::warn!("create {dest:?}: {e}");
+                log::warn!("create {dest_part:?}: {e}");
                 return (2, None);
             }
         };
@@ -344,31 +357,63 @@ impl Dispatcher {
                 Ok(n) => n,
                 Err(e) => {
                     log::warn!("download read {url}: {e}");
-                    let _ = std::fs::remove_file(&dest);
+                    let _ = std::fs::remove_file(&dest_part);
                     return (3, None);
                 }
             };
             total += n as u64;
             if total > max_bytes {
                 log::warn!("download too large: {total} > max {max_bytes}");
-                let _ = std::fs::remove_file(&dest);
+                let _ = std::fs::remove_file(&dest_part);
                 return (3, None);
             }
             if let Err(e) = file.write_all(&buf[..n]) {
-                log::warn!("write {dest:?}: {e}");
-                let _ = std::fs::remove_file(&dest);
+                log::warn!("write {dest_part:?}: {e}");
+                let _ = std::fs::remove_file(&dest_part);
                 return (2, None);
             }
         }
         if let Err(e) = file.flush() {
-            log::warn!("flush {dest:?}: {e}");
-            let _ = std::fs::remove_file(&dest);
+            log::warn!("flush {dest_part:?}: {e}");
+            let _ = std::fs::remove_file(&dest_part);
+            return (2, None);
+        }
+
+        // 原子落盘：同目录 rename（POSIX 原子），半成品只会以 .part 存在且
+        // Moonraker 按扩展名过滤不会把它列进打印列表。
+        if let Err(e) = std::fs::rename(&dest_part, &dest) {
+            log::warn!("rename {dest_part:?} -> {dest:?}: {e}");
+            let _ = std::fs::remove_file(&dest_part);
             return (2, None);
         }
 
         // 共享目录方案（D16）：落盘即被 Moonraker 自动发现，无需调用 server.files.upload。
         log::info!("download ok: {safe} -> {dest:?} ({total} bytes)");
         (0, Some(dest.to_string_lossy().into_owned()))
+    }
+
+    /// 判断 Moonraker 当前是否正在打印 `name`（print_stats.filename 相对 gcodes 根）。
+    /// 查询失败按"未在打印"放行——保护是尽力而为，不应阻塞正常下载。
+    fn printing_file_is(&mut self, name: &str) -> bool {
+        match self.mr.request(
+            "printer.objects.query",
+            json!({ "objects": { "print_stats": ["filename"] } }),
+            Duration::from_secs(5),
+        ) {
+            Ok(v) => {
+                let current =
+                    v.pointer("/status/print_stats/filename").and_then(Value::as_str).unwrap_or("");
+                let busy = !current.is_empty() && current == name;
+                if busy {
+                    log::warn!("download: file {name} is currently printing");
+                }
+                busy
+            }
+            Err(e) => {
+                log::warn!("query print_stats.filename failed: {e}");
+                false
+            }
+        }
     }
 }
 
