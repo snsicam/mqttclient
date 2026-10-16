@@ -172,9 +172,13 @@ impl Dispatcher {
                 // （10×10 点阵）远超平台命令超时窗口，不能等 BED_MESH_CALIBRATE
                 // 执行完；调平开始置 1，成功/失败由 notify_gcode_response 判定，
                 // 结果经 status_level（levelingStatus 1→2/3）上报。
-                let _ = self.event_tx.send(Event::LevelingStarted);
+                // 先等「写入 websocket」回执再置 1：若写入失败（如断线竞态）直接
+                // 回 ERR，否则调平状态会永久卡在"调平中"。
                 match self.mr.request_no_wait("printer.gcode.script", json!({ "script": "BED_MESH_CALIBRATE" })) {
-                    Ok(()) => "OK".into(),
+                    Ok(()) => {
+                        let _ = self.event_tx.send(Event::LevelingStarted);
+                        "OK".into()
+                    }
                     Err(e) => format!("ERR: {e}"),
                 }
             }

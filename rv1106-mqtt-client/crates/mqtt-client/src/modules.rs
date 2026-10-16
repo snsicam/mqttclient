@@ -27,6 +27,11 @@ const STATUS_IDLE_INTERVAL_SECS: u64 = 5 * 60;
 const STATUS_BUSY_INTERVAL_SECS: u64 = 10;
 /// 状态脏标记发布限流：Moonraker 温度通知可能 ~1s 一条，避免状态包风暴。
 const DIRTY_PUBLISH_MIN_INTERVAL_SECS: u64 = 3;
+/// 调平看门狗：G29N 受理即回 OK 且 BED_MESH_CALIBRATE 为 fire-and-forget，
+/// 若命令在链路上静默丢失（如 WS 半开、Moonraker RPC 层拒绝），leveling_status
+/// 会永久停在 1。超过此时长仍未收到结束通知则强制置"失败"。
+/// （显式 std 类型：本文件顶层 Duration 是 embassy_time 的，不能用于 Instant::elapsed。）
+const LEVELING_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 // ---------------------------------------------------------------------------
 // 8 个业务子模块（各持有自身状态）
@@ -43,6 +48,8 @@ pub struct LoginModule {
 pub struct StatusModule {
     /// Moonraker 状态更新事件待处理。
     pub dirty: bool,
+    /// 调平开始时刻（LevelingStarted 事件时记录），供调平看门狗兜底；None=非调平中。
+    pub leveling_started_at: Option<std::time::Instant>,
 }
 
 #[derive(Default)]
@@ -138,6 +145,27 @@ impl AppModule {
         }
     }
 
+    /// 调平看门狗：受理置 1 后超过 LEVELING_WATCHDOG 仍无结束通知，强制置 3
+    /// 并立即上报。正常结束（2/3）或非调平中时不动作；看门狗触发后清除计时，
+    /// 下次调平重新计时。
+    fn leveling_watchdog(&mut self) {
+        let Some(started) = self.mods.status.leveling_started_at else { return };
+        let force_fail = {
+            let s = self.state.lock().unwrap();
+            s.leveling_status == 1 && started.elapsed() > LEVELING_WATCHDOG
+        };
+        if force_fail {
+            self.mods.status.leveling_started_at = None;
+            {
+                let mut s = self.state.lock().unwrap();
+                s.leveling_status = 3;
+            }
+            log::warn!("leveling watchdog: no leveling result within 30min, force FAILED");
+            self.mods.status.dirty = true;
+            self.force_publish = true;
+        }
+    }
+
     fn enqueue(&mut self, payload: Vec<u8>) {
         self.fifo.push(FifoItem { payload });
         self.force_publish = true;
@@ -189,6 +217,7 @@ impl AppModule {
                         s.leveling_status = 1;
                         s.leveling_point = 0;
                     }
+                    self.mods.status.leveling_started_at = Some(std::time::Instant::now());
                     self.mods.status.dirty = true;
                     self.force_publish = true;
                 }
@@ -445,6 +474,9 @@ impl MqttModule for AppModule {
         // 1. 消费事件
         self.drain_events();
 
+        // 1.5 调平看门狗：链路静默丢失 BED_MESH_CALIBRATE 时兜底置"失败"
+        self.leveling_watchdog();
+
         // 2. login 回复超时处理：连接仍存活则主动重发 login（给平台第二次机会，
         //    避免仅靠 keepalive 断线才重登导致期间不登录）；重试超限再标记错误由断线重连。
         if self.conn.login_reply_timeout(now) {
@@ -656,8 +688,38 @@ mod tests {
         m.drain_events();
         assert_eq!(m.state.lock().unwrap().leveling_status, 1);
         assert_eq!(m.state.lock().unwrap().leveling_point, 0);
+        assert!(m.mods.status.leveling_started_at.is_some(), "应记录调平开始时刻供看门狗使用");
         assert!(m.mods.status.dirty);
         assert!(m.needs_immediate_publish());
+    }
+
+    /// 调平看门狗：受理后 30min 仍无结束通知 → 强制置"失败"并立即上报。
+    /// 兜底 fire-and-forget 的 BED_MESH_CALIBRATE 在链路上静默丢失的场景。
+    #[test]
+    fn leveling_watchdog_forces_failed() {
+        let (mut m, tx) = test_module();
+        tx.send(Event::LevelingStarted).unwrap();
+        m.drain_events();
+        assert_eq!(m.state.lock().unwrap().leveling_status, 1);
+
+        // 未超时：不动
+        m.leveling_watchdog();
+        assert_eq!(m.state.lock().unwrap().leveling_status, 1);
+
+        // 模拟已超时 31 分钟：强制置 3
+        m.mods.status.leveling_started_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(31 * 60));
+        m.leveling_watchdog();
+        assert_eq!(m.state.lock().unwrap().leveling_status, 3, "超时应强制置失败");
+        assert!(m.mods.status.leveling_started_at.is_none(), "触发后应清除计时");
+        assert!(m.needs_immediate_publish(), "应立即上报");
+
+        // 已结束（status=2）时即使残留超时时刻也不动作
+        m.state.lock().unwrap().leveling_status = 2;
+        m.mods.status.leveling_started_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(31 * 60));
+        m.leveling_watchdog();
+        assert_eq!(m.state.lock().unwrap().leveling_status, 2, "已结束不应被看门狗改写");
     }
 
     /// 未绑定（bindState 非 0）时不得对外发送状态包与 FIFO 包。
