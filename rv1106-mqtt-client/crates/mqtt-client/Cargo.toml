@@ -24,6 +24,7 @@ log.workspace = true
 env_logger.workspace = true
 ureq = "3"
 futures = "0.3"
+libc = "0.2"
 bluer.workspace = true
 tokio.workspace = true
 

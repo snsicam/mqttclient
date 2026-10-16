@@ -971,6 +971,7 @@ dependencies = [
  "embassy-time",
  "env_logger",
  "futures",
+ "libc",
  "log",
  "myrtio-mqtt",
  "serde",

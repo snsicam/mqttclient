@@ -105,8 +105,37 @@ fn write_main_conf(path: &str, content: &str, name: &str) {
     }
 }
 
+/// 单实例保护：对锁文件做非阻塞 flock。已有实例持有锁时立即 exit(1)；
+/// 进程退出（含被 kill/崩溃）时内核自动释放锁，无残留文件问题，也无需清理。
+/// /tmp 为 tmpfs，板上任何运行环境都可写。
+fn acquire_single_instance() {
+    use std::os::unix::io::AsRawFd;
+    const LOCK_PATH: &str = "/tmp/mqtt-client.lock";
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(LOCK_PATH)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            log::warn!("single-instance: open {LOCK_PATH} failed: {e} — 跳过单实例检查");
+            return;
+        }
+    };
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        log::error!("another mqtt-client instance is already running (lock {LOCK_PATH}) — exiting");
+        std::process::exit(1);
+    }
+    // 故意泄漏 fd：保持 flock 持有到进程退出（退出时内核自动释放）。
+    std::mem::forget(file);
+    log::info!("single-instance: lock acquired ({LOCK_PATH})");
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    acquire_single_instance();
     // 启动即打印版本与编译时间，便于部署后从日志确认烧录的是哪个构建。
     log::info!(
         "mqtt-client v{} (git {}) built at {}",
