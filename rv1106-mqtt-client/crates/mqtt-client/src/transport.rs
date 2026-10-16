@@ -129,6 +129,8 @@ impl MqttTransport for StdTcpTransport {
     async fn recv_timeout(&mut self, buf: &mut [u8], timeout: std::time::Duration) -> Result<usize, StdError> {
         let stream = self.stream.as_mut().ok_or(StdError::NotConnected)?;
         stream.set_nonblocking(false).map_err(StdError::from)?;
+        // 防御：0 超时对 set_read_timeout 是非法值（InvalidInput），钳到 1ms。
+        let timeout = if timeout.is_zero() { std::time::Duration::from_millis(1) } else { timeout };
         let res = {
             stream
                 .set_read_timeout(Some(timeout))

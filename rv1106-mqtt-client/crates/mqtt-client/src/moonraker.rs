@@ -639,7 +639,12 @@ pub mod state_bridge {
                         s.print_elapsed_secs = pd as u64;
                     }
                     if let Some(td) = num_opt(attrs, "total_duration") {
-                        s.print_remain_secs = (td - s.print_elapsed_secs as f64).max(0.0) as u64;
+                        // 暂停时 total_duration 仍在走表（暂停语义只冻结 print_duration），
+                        // 继续计算会让剩余时间"越暂停越多"；冻结在暂停前的值。
+                        if s.print_state != crate::app_state::PrintState::Paused as u8 {
+                            s.print_remain_secs =
+                                (td - s.print_elapsed_secs as f64).max(0.0) as u64;
+                        }
                     }
                 }
                 "virtual_sdcard" => {
@@ -867,6 +872,38 @@ mod tests {
         assert_eq!(p(&json!("abc")), None);
         assert_eq!(p(&json!("")), None);
         assert_eq!(p(&json!(null)), None);
+    }
+
+    /// 回归（暂停剩余时间持续增长）：暂停时 total_duration 仍在走表，
+    /// printRemainTime 必须冻结在暂停前的值，恢复打印后才继续更新。
+    #[test]
+    fn bridge_freezes_remain_time_while_paused() {
+        let mut s = AppState::default();
+        // 打印中：elapsed 180s，total 600s → remain 420s
+        let printing = json!({
+            "print_stats": {"state": "printing", "filename": "a.gcode",
+                            "progress": 0.3, "print_duration": 180.0, "total_duration": 600.0}
+        });
+        state_bridge::apply(&mut s, printing.as_object().unwrap());
+        assert_eq!(s.print_state, crate::app_state::PrintState::Printing as u8);
+        assert_eq!(s.print_remain_secs, 420);
+
+        // 暂停：state 变 paused，total_duration 继续增长到 700s → remain 保持 420
+        let paused = json!({
+            "print_stats": {"state": "paused", "filename": "a.gcode",
+                            "progress": 0.3, "print_duration": 180.0, "total_duration": 700.0}
+        });
+        state_bridge::apply(&mut s, paused.as_object().unwrap());
+        assert_eq!(s.print_state, crate::app_state::PrintState::Paused as u8);
+        assert_eq!(s.print_remain_secs, 420, "暂停时剩余时间应冻结");
+
+        // 恢复打印：total_duration 800s → remain = 800 - 180 = 620，重新计算
+        let resumed = json!({
+            "print_stats": {"state": "printing", "filename": "a.gcode",
+                            "progress": 0.3, "print_duration": 180.0, "total_duration": 800.0}
+        });
+        state_bridge::apply(&mut s, resumed.as_object().unwrap());
+        assert_eq!(s.print_remain_secs, 620, "恢复打印后剩余时间应重新计算");
     }
 
     /// 调平失败判定只认调平相关错误：调平期间无关命令的 `!!` 报错
