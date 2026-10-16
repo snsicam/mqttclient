@@ -32,7 +32,7 @@ pub enum GcodeKind {
 }
 
 /// 解析 M 码：`"M32 x.gcode"` → `Some((32, "x.gcode"))`。
-/// 精确提取数字，避免 `M300`（提示音）被误判为 `M30`（删除文件）。
+/// 精确提取数字，避免 `M300`（提示音，直通）被误判为 `M30`（删除文件）。
 fn mcode(cmd: &str) -> Option<(u32, &str)> {
     let t = cmd.trim_start();
     if !t.starts_with(['M', 'm']) {
@@ -57,6 +57,10 @@ fn first_token(s: &str) -> String {
 }
 
 /// 转换单条 GCODE。
+///
+/// 仅处理平台协议命令（文件操作 / 打印控制 / 调平）。Marlin 方言命令
+/// （M92/M201/M203/M205/M300/M420/M600 等）由设备端 macros-marlin.cfg 的
+/// Klipper 宏统一实现，此处直通不重复翻译。
 pub fn translate(cmd: &str) -> GcodeKind {
     let trimmed = cmd.trim();
     if trimmed.is_empty() {
@@ -75,10 +79,11 @@ pub fn translate(cmd: &str) -> GcodeKind {
         Some((20, _)) => GcodeKind::ListFiles,
         Some((24, _)) => GcodeKind::Resume,
         Some((25, _)) => GcodeKind::Pause,
-        Some((26, _)) => GcodeKind::Cancel,
-        // M28/M29：Klipper 原生报错（"SD write not supported"）
+        // M26 / M524（Marlin 取消打印，Klipper 无 M524）→ printer.print.cancel
+        Some((26, _)) | Some((524, _)) => GcodeKind::Cancel,
+        // M28/M29：Klipper 原生报错（"SD write not supported"），显式拒绝
         Some((28, _)) | Some((29, _)) => GcodeKind::Unsupported(trimmed.to_string()),
-        // 其余（G 码、M104/M140/M106/M107/M115/M117/M118/M23/M300…）Klipper 原生支持 → 直通
+        // 其余 → 直通（Marlin 方言命令由设备端 macros-marlin.cfg 宏处理）
         _ => GcodeKind::Native(trimmed.to_string()),
     }
 }
@@ -107,6 +112,8 @@ mod tests {
         assert_eq!(translate("M24"), GcodeKind::Resume);
         assert_eq!(translate("M25"), GcodeKind::Pause);
         assert_eq!(translate("M26"), GcodeKind::Cancel);
+        assert_eq!(translate("M524"), GcodeKind::Cancel, "Marlin 取消打印 M524");
+        assert_eq!(translate("M524 C"), GcodeKind::Cancel, "M524 带参数");
     }
 
     #[test]
@@ -119,9 +126,28 @@ mod tests {
 
     #[test]
     fn translate_m30_vs_m300() {
-        // M30 删除文件；M300（提示音）必须直通，不能被 M30 前缀误匹配
+        // M30 删除文件；M300（提示音）不能被 M30 前缀误匹配
         assert_eq!(translate("M30 a.gcode"), GcodeKind::DeleteFile("a.gcode".into()));
-        assert_eq!(translate("M300 S1000 P200"), GcodeKind::Native("M300 S1000 P200".into()));
+        assert_eq!(
+            translate("M300 S1000 P200"),
+            GcodeKind::Native("M300 S1000 P200".into()),
+            "M300 与 M30 仅前缀之差，必须精确区分"
+        );
+    }
+
+    #[test]
+    fn translate_marlin_dialect_passthrough() {
+        // Marlin 方言命令不再翻译：由设备端 macros-marlin.cfg（Klipper 宏）统一处理
+        assert_eq!(translate("M201 X1000 Y2000"), GcodeKind::Native("M201 X1000 Y2000".into()));
+        assert_eq!(translate("M203 X500 Y300"), GcodeKind::Native("M203 X500 Y300".into()));
+        assert_eq!(translate("M205 J0.05"), GcodeKind::Native("M205 J0.05".into()));
+        assert_eq!(translate("M92 X80"), GcodeKind::Native("M92 X80".into()));
+        assert_eq!(translate("M851 Z-1.5"), GcodeKind::Native("M851 Z-1.5".into()));
+        assert_eq!(translate("M401"), GcodeKind::Native("M401".into()));
+        assert_eq!(translate("M402"), GcodeKind::Native("M402".into()));
+        assert_eq!(translate("M206 Z0.2"), GcodeKind::Native("M206 Z0.2".into()));
+        assert_eq!(translate("M420 S1"), GcodeKind::Native("M420 S1".into()));
+        assert_eq!(translate("M600"), GcodeKind::Native("M600".into()), "换丝由 macros.cfg 交互实现");
     }
 
     #[test]
