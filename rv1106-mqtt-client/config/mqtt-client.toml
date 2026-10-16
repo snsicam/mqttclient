@@ -52,9 +52,10 @@ socket_path = "/run/mqtt-client/ui.sock"
 [blufi]
 # 蓝牙配网（BluFi）相关配置
 enabled = true
-# 扫描列表单帧字节上限：0=不限（超过 255 字节自动按 BluFi 分片，不丢热点）；
-# 仅当对端 APP 收到分片即断连时，才设为 255 退化为单帧（丢弃装不下的最弱热点）。
-scan_single_frame_bytes = 0
+# WiFi 列表单帧上限（字节）。0=全量列表+自动 BluFi 分片（需 App 支持分片重组）；
+# >0=单帧发送，按 RSSI 强度截断保留最强热点。当前 App 不支持 BluFi 分片
+# （收到 FRAGMENTED 帧会 StopNotify 断连），必须用单帧模式。
+scan_single_frame_bytes = 255
 ack_repeat = 3
 ack_interval_ms = 500
 scan_timeout_ms = 5000
