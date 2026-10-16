@@ -182,6 +182,16 @@ impl AppModule {
                     self.mods.status.dirty = true;
                     self.force_publish = true;
                 }
+                Event::LevelingStarted => {
+                    // 调平开始：置调平中（1），清零点进度，立即上报 status_level。
+                    {
+                        let mut s = self.state.lock().unwrap();
+                        s.leveling_status = 1;
+                        s.leveling_point = 0;
+                    }
+                    self.mods.status.dirty = true;
+                    self.force_publish = true;
+                }
                 Event::MrConnected => {
                     self.state.lock().unwrap().moonraker_connected = true;
                     self.ui_state.lock().unwrap().moonraker_connected = true;
@@ -635,6 +645,18 @@ mod tests {
         tx.send(Event::GcodeResult { cmd_type: "M115".into(), result: "OK".into() }).unwrap();
         m.drain_events();
         assert!(!m.fifo.is_empty());
+        assert!(m.needs_immediate_publish());
+    }
+
+    /// 调平开始事件：置调平中（1）并立即触发状态包（对齐 Marlin G29 开始 WORKING）。
+    #[test]
+    fn event_leveling_started_sets_working() {
+        let (mut m, tx) = test_module();
+        tx.send(Event::LevelingStarted).unwrap();
+        m.drain_events();
+        assert_eq!(m.state.lock().unwrap().leveling_status, 1);
+        assert_eq!(m.state.lock().unwrap().leveling_point, 0);
+        assert!(m.mods.status.dirty);
         assert!(m.needs_immediate_publish());
     }
 

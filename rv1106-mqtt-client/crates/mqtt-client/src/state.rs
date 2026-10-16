@@ -14,6 +14,9 @@ use crate::downlink::UiReply;
 pub enum Event {
     /// Moonraker 状态已更新（AppState 已被写入），应尽快发布状态包。
     StatusUpdated,
+    /// 调平开始（云端 G29N → `BED_MESH_CALIBRATE` 下发时触发，置 levelingStatus=1；
+    /// 完成/失败由 Moonraker `notify_gcode_response` 判定，对齐 Marlin G29 语义）。
+    LevelingStarted,
     /// Moonraker 已连接（Klippy 就绪）。
     MrConnected,
     /// Moonraker 断线。

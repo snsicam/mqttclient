@@ -167,7 +167,17 @@ impl Dispatcher {
         match translate(raw) {
             GcodeKind::Empty => "OK".into(),
             GcodeKind::Native(text) => self.script(&text),
-            GcodeKind::Leveling => self.script("BED_MESH_CALIBRATE"),
+            GcodeKind::Leveling => {
+                // 对齐协议示例（G29N → execResult:"OK"）：受理即回 OK——调平耗时
+                // （10×10 点阵）远超平台命令超时窗口，不能等 BED_MESH_CALIBRATE
+                // 执行完；调平开始置 1，成功/失败由 notify_gcode_response 判定，
+                // 结果经 status_level（levelingStatus 1→2/3）上报。
+                let _ = self.event_tx.send(Event::LevelingStarted);
+                match self.mr.request_no_wait("printer.gcode.script", json!({ "script": "BED_MESH_CALIBRATE" })) {
+                    Ok(()) => "OK".into(),
+                    Err(e) => format!("ERR: {e}"),
+                }
+            }
             GcodeKind::PrintStart(file) => match self.mr.request("printer.print.start", json!({ "filename": file }), Duration::from_secs(10)) {
                 Ok(_) => "File selected OK".into(),
                 Err(e) => format!("File open failed: {e}"),
