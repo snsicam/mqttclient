@@ -162,6 +162,9 @@ pub struct MrCommand {
     pub params: Value,
     /// 响应回传端：`None` 表示 fire-and-forget（不注册 pending，响应按未知 id 丢弃）。
     pub resp: Option<mpsc::Sender<Result<Value, String>>>,
+    /// no-wait 语义：`resp` 只回传「写入 websocket」的结果（成功即回 `Ok`），
+    /// 不注册 pending；随后的 RPC 响应按未知 id 处理（错误记日志）。
+    pub no_wait: bool,
 }
 
 /// dispatcher 使用的同步命令句柄。
@@ -177,19 +180,26 @@ impl MrHandle {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
         self.cmd_tx
-            .send(MrCommand { id, method: method.into(), params, resp: Some(tx) })
+            .send(MrCommand { id, method: method.into(), params, resp: Some(tx), no_wait: false })
             .map_err(|_| "moonraker worker stopped".to_string())?;
         rx.recv_timeout(timeout).map_err(|_| format!("moonraker timeout: {method}"))?
     }
 
-    /// 发起请求但不等待响应（fire-and-forget）：仅保证请求已提交/写入 websocket，
-    /// 响应按未知 id 丢弃。用于长耗时命令（如 BED_MESH_CALIBRATE）——结果经
-    /// 状态通知上报，不能阻塞应答。
+    /// 发起请求但不等待 RPC 响应（fire-and-forget）：等待「写入 websocket」回执
+    /// （≤5s），写入失败立即返回 Err。用于长耗时命令（如 BED_MESH_CALIBRATE）——
+    /// 执行结果经状态通知上报，不能阻塞应答；RPC 层错误（如 Klippy 未连接）按
+    /// 未知 id 记日志，由调用侧的调平看门狗兜底。
     pub fn request_no_wait(&self, method: &str, params: Value) -> Result<(), String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel();
         self.cmd_tx
-            .send(MrCommand { id, method: method.into(), params, resp: None })
-            .map_err(|_| "moonraker worker stopped".to_string())
+            .send(MrCommand { id, method: method.into(), params, resp: Some(tx), no_wait: true })
+            .map_err(|_| "moonraker worker stopped".to_string())?;
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(format!("moonraker timeout: {method}")),
+        }
     }
 }
 
@@ -277,6 +287,9 @@ impl MoonrakerWorker {
                     Err(e) => {
                         log::warn!("moonraker read error: {e}");
                         self.client.close();
+                        // 旧连接上的未应答请求永远不会收到响应，条目若不清除
+                        // 会随断线累积泄漏（Sender 连同其堆内存滞留至进程退出）。
+                        self.pending.clear();
                         self.state.lock().unwrap().moonraker_connected = false;
                         let _ = self.event_tx.send(Event::MrDisconnected);
                         break;
@@ -310,6 +323,7 @@ impl MoonrakerWorker {
                     if let Err(e) = self.client.send_text(&text) {
                         log::warn!("moonraker heartbeat write: {e}");
                         self.client.close();
+                        self.pending.clear();
                         self.state.lock().unwrap().moonraker_connected = false;
                         let _ = self.event_tx.send(Event::MrDisconnected);
                     }
@@ -329,11 +343,17 @@ impl MoonrakerWorker {
         });
         match text {
             Ok(t) => match self.client.send_text(&t) {
-                Ok(()) => {
-                    if let Some(tx) = c.resp {
+                Ok(()) => match (c.no_wait, c.resp) {
+                    // no-wait：写入即回执（request_no_wait 等的就是这个结果），
+                    // 不注册 pending，RPC 响应按未知 id 处理。
+                    (true, Some(tx)) => {
+                        let _ = tx.send(Ok(Value::Null));
+                    }
+                    (false, Some(tx)) => {
                         self.pending.insert(c.id, tx);
                     }
-                }
+                    (_, None) => {}
+                },
                 Err(e) => {
                     if let Some(tx) = c.resp {
                         let _ = tx.send(Err(e));
@@ -410,7 +430,9 @@ impl MoonrakerWorker {
             "notify_gcode_response" => {
                 // 调平结束检测（对齐 Marlin G29_RETURN 结束即推 status_level）：
                 // - 成功：Klipper 输出 "Mesh Bed Leveling Complete"（extras/bed_mesh.py:786）
-                // - 失败：`!!` 前缀错误响应（探针异常等）
+                // - 失败：`!!` 前缀且错误与调平相关（探针/归位/网格/Klipper shutdown）。
+                //   不能匹配一切 `!!`：调平期间平台/屏幕下发的无关命令报错会把
+                //   "调平中"误判为失败，随后调平正常完成又翻回 2，状态来回抖动。
                 if let Some(params) = &n.params {
                     if let Some(resp) = params.get(0).and_then(Value::as_str) {
                         let mut s = self.state.lock().unwrap();
@@ -419,7 +441,10 @@ impl MoonrakerWorker {
                             s.leveling_point = s.leveling_total;
                             drop(s);
                             let _ = self.event_tx.send(Event::StatusUpdated);
-                        } else if resp.starts_with("!!") && s.leveling_status == 1 {
+                        } else if resp.starts_with("!!")
+                            && s.leveling_status == 1
+                            && is_leveling_error(resp)
+                        {
                             s.leveling_status = 3;
                             drop(s);
                             let _ = self.event_tx.send(Event::StatusUpdated);
@@ -536,6 +561,30 @@ impl MoonrakerWorker {
 /// 订阅与状态归类均按首词进行。
 fn first_word(name: &str) -> &str {
     name.split(' ').next().unwrap_or(name)
+}
+
+/// `!!` 错误是否与调平相关（网格/探针/归位/掉电 shutdown）。调平执行期间
+/// 平台或屏幕下发的无关命令报错不应把"调平中"误判为"调平失败"。
+fn is_leveling_error(resp: &str) -> bool {
+    const NEEDLES: [&str; 7] =
+        ["BED_MESH", "bed_mesh", "probe", "Probe", "home", "shutdown", "Shutdown"];
+    NEEDLES.iter().any(|k| resp.contains(k))
+}
+
+/// 解析 bed_mesh.probe_count 配置值。configfile.settings 中的值是原始字符串
+/// （"5"、"5,5"、"5, 5, 3"），单值 n → n×n，多值取前两个 x×y。上限 255。
+fn parse_probe_count(v: &Value) -> Option<u8> {
+    let counts: Vec<u32> = match v {
+        Value::String(s) => s.split(',').filter_map(|p| p.trim().parse().ok()).collect(),
+        Value::Number(n) => vec![n.as_u64()? as u32],
+        _ => return None,
+    };
+    let (x, y) = match counts.as_slice() {
+        [n] => (*n, *n),
+        [x, y, ..] => (*x, *y),
+        _ => return None,
+    };
+    Some(((x * y) as usize).min(255) as u8)
 }
 
 /// 从 `printer.objects.list` 结果中筛出可订阅对象：对象名精确命中或首词命中
@@ -662,6 +711,16 @@ pub mod state_bridge {
                         s.level_ok = pe;
                     }
                 }
+                "configfile" => {
+                    // 首次调平（无网格、probed_matrix 为空）时 leveling_total 仍为 0，
+                    // 平台调平进度显示 0/0。从 bed_mesh.probe_count（configfile 配置）
+                    // 初始化总点数；已有网格推得的实际点数优先，不覆盖。
+                    let Some(bm) = attrs.get("settings").and_then(|st| st.get("bed_mesh")) else { continue };
+                    let Some(total) = bm.get("probe_count").and_then(parse_probe_count) else { continue };
+                    if s.leveling_total == 0 {
+                        s.leveling_total = total;
+                    }
+                }
                 _ => {}
             }
         }
@@ -771,6 +830,56 @@ mod tests {
         let cleared = json!({ "bed_mesh": {"profile_name": "", "profiles": {}, "probed_matrix": [[]]} });
         state_bridge::apply(&mut s, cleared.as_object().unwrap());
         assert!(!s.level_ok, "网格清除且无 profile 应视为未调平");
+    }
+
+    /// 回归（首次调平总点数为 0）：configfile.settings.bed_mesh.probe_count
+    /// 应初始化 leveling_total（首次调平时 probed_matrix 尚为空，平台显示 0/0）。
+    #[test]
+    fn bridge_inits_leveling_total_from_probe_count() {
+        let mut s = AppState::default();
+        let cfg = json!({
+            "configfile": {"settings": {"bed_mesh": {"probe_count": "5, 5"}}}
+        });
+        state_bridge::apply(&mut s, cfg.as_object().unwrap());
+        assert_eq!(s.leveling_total, 25, "probe_count 5,5 → 总点数 25");
+
+        // 已有网格推得的实际点数优先，不被 configfile 覆盖
+        let mesh = json!({ "bed_mesh": {"profiles": {}, "probed_matrix": [[0.1, 0.2], [0.3, 0.4]]} });
+        state_bridge::apply(&mut s, mesh.as_object().unwrap());
+        assert_eq!(s.leveling_total, 4);
+
+        let cfg2 = json!({
+            "configfile": {"settings": {"bed_mesh": {"probe_count": "9,9"}}}
+        });
+        state_bridge::apply(&mut s, cfg2.as_object().unwrap());
+        assert_eq!(s.leveling_total, 4, "非 0 的实际点数不应被配置值覆盖");
+    }
+
+    /// probe_count 支持单值（n→n×n）与多值（x,y[,z]）；非法/缺失返回 None。
+    #[test]
+    fn parse_probe_count_variants() {
+        let p = super::parse_probe_count;
+        assert_eq!(p(&json!("5")), Some(25));
+        assert_eq!(p(&json!("5,5")), Some(25));
+        assert_eq!(p(&json!("5, 5")), Some(25));
+        assert_eq!(p(&json!("3,3,5")), Some(9));
+        assert_eq!(p(&json!(5)), Some(25));
+        assert_eq!(p(&json!("abc")), None);
+        assert_eq!(p(&json!("")), None);
+        assert_eq!(p(&json!(null)), None);
+    }
+
+    /// 调平失败判定只认调平相关错误：调平期间无关命令的 `!!` 报错
+    /// （如 M420 参数错误）不应把"调平中"改判为失败。
+    #[test]
+    fn leveling_error_matching_is_scoped() {
+        let f = super::is_leveling_error;
+        assert!(f("!! Must home axis first"));
+        assert!(f("!! Probe triggered prior to movement"));
+        assert!(f("!! BED_MESH_CALIBRATE: invalid parameter"));
+        assert!(f("!! Klipper shutdown: MCU 'probe' shutdown"));
+        assert!(!f("!! M420: unknown parameter 'S'"), "无关命令报错不判调平失败");
+        assert!(!f("!! Extrude below minimum temp"));
     }
 
     #[test]
