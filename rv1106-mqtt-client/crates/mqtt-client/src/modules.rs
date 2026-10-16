@@ -285,12 +285,16 @@ impl AppModule {
                     }
                 }
                 Event::FileListResult { files } => {
+                    // 概要设计 §file_list：fileTotal=总页数（每页 ≤10 个），fileIndex 从 1 起；
+                    // 无文件发空列表（fileTotal=0, fileIndex=0）。此前误用「文件总数 + 0 起页码」，
+                    // App 按规范等待 fileIndex=1..pages 的包，一个都等不到 → 列表永远显示不出来。
                     let total = files.len();
                     if total == 0 {
                         self.enqueue( UplinkMsg::file_list_reply(&self.cfg.device.id, 0, 0, &[], now));
                     } else {
+                        let pages = total.div_ceil(10);
                         for (i, chunk) in files.chunks(10).enumerate() {
-                            self.enqueue( UplinkMsg::file_list_reply(&self.cfg.device.id, total, i, chunk, now));
+                            self.enqueue( UplinkMsg::file_list_reply(&self.cfg.device.id, pages, i + 1, chunk, now));
                         }
                     }
                 }
@@ -586,6 +590,44 @@ mod tests {
         fn publish(&mut self, topic: &str, payload: &[u8], _qos: QoS) {
             self.items.push((topic.to_string(), payload.to_vec()));
         }
+    }
+
+    /// 回归（TF 卡文件列表不显示）：file_list 分页必须符合概要设计——
+    /// fileTotal=总页数、fileIndex 从 1 起、每页 ≤10 个文件、无文件发空列表。
+    /// 此前实现误发「fileTotal=文件总数、fileIndex 从 0 起」，App 按规范
+    /// 等待 fileIndex=1..pages 的包全部落空，列表永远为空。
+    #[test]
+    fn file_list_paging_matches_spec() {
+        let (mut m, tx) = test_module();
+        let mk = |n: usize| (0..n).map(|i| (format!("f{i}.gcode"), 100u64)).collect::<Vec<_>>();
+
+        // 12 个文件 → 2 页：第一页 10 个（fileIndex=1），第二页 2 个（fileIndex=2）
+        tx.send(Event::FileListResult { files: mk(12) }).unwrap();
+        m.drain_events();
+        assert_eq!(m.fifo.len(), 2);
+        let take = |m: &mut AppModule, i: usize| -> serde_json::Value {
+            let item = m.fifo.pop().expect("fifo item");
+            assert_eq!(i, 0, "按入队顺序逐个出队");
+            serde_json::from_slice(&item.payload).unwrap()
+        };
+        let p1 = take(&mut m, 0);
+        let p2 = take(&mut m, 0);
+        assert_eq!(p1["type"], "file_list");
+        assert_eq!(p1["fileTotal"], 2, "fileTotal 应为总页数而非文件总数");
+        assert_eq!(p1["fileIndex"], 1, "页码从 1 起");
+        assert_eq!(p1["fileList"].as_array().unwrap().len(), 10);
+        assert_eq!(p2["fileTotal"], 2);
+        assert_eq!(p2["fileIndex"], 2);
+        assert_eq!(p2["fileList"].as_array().unwrap().len(), 2);
+
+        // 空列表：fileTotal=0, fileIndex=0, fileList=[]
+        tx.send(Event::FileListResult { files: vec![] }).unwrap();
+        m.drain_events();
+        assert_eq!(m.fifo.len(), 1);
+        let p0: serde_json::Value = serde_json::from_slice(&m.fifo.pop().unwrap().payload).unwrap();
+        assert_eq!(p0["fileTotal"], 0);
+        assert_eq!(p0["fileIndex"], 0);
+        assert_eq!(p0["fileList"].as_array().unwrap().len(), 0);
     }
 
     fn test_module() -> (AppModule, mpsc::Sender<Event>) {
