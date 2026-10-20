@@ -42,16 +42,24 @@ pub fn split_type(t: u8) -> (u8, u8) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameError {
     TooShort,
+    /// 分片序列非法：重组进行中又收到"首片"（协议要求续片段不带 FRAGMENTED 标志）。
+    BadFragment,
     #[allow(dead_code)]
     BadType,
-    LenMismatch { expect: usize, actual: usize },
-    ChecksumMismatch { got: u16, calc: u16 },
+    LenMismatch {
+        expect: usize,
+        actual: usize,
+    },
+    ChecksumMismatch {
+        got: u16,
+        calc: u16,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub struct BluFiFrame {
-    pub pkg_type: u8, // PKG_CTRL | PKG_DATA
-    pub subtype: u8,  // 功能码，见 ftype
+    pub pkg_type: u8,   // PKG_CTRL | PKG_DATA
+    pub subtype: u8,    // 功能码，见 ftype
     pub frame_ctrl: u8, // 见 fc
     pub sequence: u8,
     pub data: Vec<u8>,
@@ -59,7 +67,13 @@ pub struct BluFiFrame {
 
 impl BluFiFrame {
     pub fn new(pkg_type: u8, subtype: u8, frame_ctrl: u8, sequence: u8, data: Vec<u8>) -> Self {
-        Self { pkg_type, subtype, frame_ctrl, sequence, data }
+        Self {
+            pkg_type,
+            subtype,
+            frame_ctrl,
+            sequence,
+            data,
+        }
     }
     pub fn type_byte(&self) -> u8 {
         type_byte(self.pkg_type, self.subtype)
@@ -155,6 +169,10 @@ pub struct FragmentAssembler {
     total: Option<usize>,
     buf: Vec<u8>,
 }
+/// 分片重组缓冲上限（64KB）：BluFi 逻辑消息（WiFi 列表等）远小于此；
+/// 防畸形/异常 APP 持续发分片帧导致 buf 无界增长。
+const MAX_REASSEMBLY_BYTES: usize = 64 * 1024;
+
 impl FragmentAssembler {
     pub fn new() -> Self {
         Self {
@@ -171,12 +189,34 @@ impl FragmentAssembler {
                 return Err(FrameError::TooShort);
             }
             let total = u16::from_le_bytes([f.data[0], f.data[1]]) as usize;
-            if self.total.is_none() {
-                self.total = Some(total);
+            // 协议约定：续片段不带 FRAGMENTED 标志。重组进行中又收到"首片"说明
+            // 链路错乱（如上一条消息的收齐帧丢失），重置并报错。
+            // （原实现会把它当续片，2 字节长度前缀被剥掉、payload 错位拼入。）
+            if self.total.is_some() {
+                self.total = None;
                 self.buf.clear();
+                return Err(FrameError::BadFragment);
             }
+            // 上限保护：防畸形帧驱动 buf 无界增长（每帧最多 +253B）。
+            if total == 0 || total > MAX_REASSEMBLY_BYTES {
+                return Err(FrameError::LenMismatch {
+                    expect: total,
+                    actual: self.buf.len(),
+                });
+            }
+            self.total = Some(total);
+            self.buf.clear();
             self.buf.extend_from_slice(&f.data[2..]);
         } else if let Some(total) = self.total {
+            // 超长保护：超出 total 的续片段为畸形流，报错并重置。
+            if self.buf.len() + f.data.len() > total {
+                self.total = None;
+                self.buf.clear();
+                return Err(FrameError::LenMismatch {
+                    expect: total,
+                    actual: self.buf.len() + f.data.len(),
+                });
+            }
             self.buf.extend_from_slice(&f.data);
             if self.buf.len() >= total {
                 let out = self.buf[..total].to_vec();
@@ -274,7 +314,13 @@ mod tests {
 
     #[test]
     fn encode_decode_roundtrip() {
-        let f = BluFiFrame::new(PKG_DATA, ftype::WIFI_LIST, fc::DIRECTION, 7, b"hello".to_vec());
+        let f = BluFiFrame::new(
+            PKG_DATA,
+            ftype::WIFI_LIST,
+            fc::DIRECTION,
+            7,
+            b"hello".to_vec(),
+        );
         let bytes = f.encode();
         let d = BluFiFrame::decode(&bytes).unwrap();
         assert_eq!(d.pkg_type, PKG_DATA);

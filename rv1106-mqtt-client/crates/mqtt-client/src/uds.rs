@@ -34,7 +34,7 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::config::UdsConfig;
 use crate::downlink::{UiCmd, UiReply};
@@ -67,7 +67,9 @@ fn run_server(cfg: &UdsConfig, ui_cmd_tx: mpsc::Sender<UiCmd>, ui_state: SharedU
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o770)) {
+                if let Err(e) =
+                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o770))
+                {
                     log::warn!("UDS chmod 0770 {parent:?}: {e}");
                 }
             }
@@ -128,21 +130,31 @@ fn dispatch(req: &[u8], ui_cmd_tx: &mpsc::Sender<UiCmd>, ui_state: &SharedUiStat
         Ok(v) => v,
         Err(e) => return error_json("", &format!("invalid json: {e}")),
     };
-    let id = v.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+    let id = v
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let method = v.get("method").and_then(Value::as_str).unwrap_or("");
     let params = v.get("params").cloned().unwrap_or(Value::Null);
 
-    log::debug!("[uds] << recv: method={method} id={id} payload={}", String::from_utf8_lossy(req));
+    log::debug!(
+        "[uds] << recv: method={method} id={id} payload={}",
+        String::from_utf8_lossy(req)
+    );
 
     match method {
         "bind_status" => {
             let s = ui_state.lock().unwrap();
-            ok_json(&id, json!({
-                "cloud_connected": s.cloud_connected,
-                "moonraker_connected": s.moonraker_connected,
-                "bind_state": s.bind_state,
-                "account": s.account,
-            }))
+            ok_json(
+                &id,
+                json!({
+                    "cloud_connected": s.cloud_connected,
+                    "moonraker_connected": s.moonraker_connected,
+                    "bind_state": s.bind_state,
+                    "account": s.account,
+                }),
+            )
         }
         "download" => {
             // 忙闲守卫（AV-1）：与 MQTT `download_begin`（或另一次 UDS 下载）共用
@@ -155,28 +167,52 @@ fn dispatch(req: &[u8], ui_cmd_tx: &mpsc::Sender<UiCmd>, ui_state: &SharedUiStat
                 s.downloading = true;
             }
             let file_type = params.get("file_type").and_then(Value::as_u64).unwrap_or(0) as u8;
-            let file_name = params.get("file_name").and_then(Value::as_str).unwrap_or("").to_string();
-            let url = params.get("url").and_then(Value::as_str).map(|s| s.to_string());
-            let resp = match request(ui_cmd_tx, |tx| UiCmd::Download { file_type, file_name, url, reply_tx: tx }) {
-                Some(reply) => reply_to_json(&id, reply),
-                None => error_json(&id, "dispatcher unavailable"),
+            let file_name = params
+                .get("file_name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let url = params
+                .get("url")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string());
+            let resp = match request(ui_cmd_tx, |tx| UiCmd::Download {
+                file_type,
+                file_name,
+                url,
+                reply_tx: tx,
+            }) {
+                ReqOutcome::Reply(reply) => reply_to_json(&id, reply),
+                ReqOutcome::SendFailed => {
+                    // Dispatcher 已退出、命令未执行：回滚忙标志（不会有 DownloadFinished 事件）。
+                    ui_state.lock().unwrap().downloading = false;
+                    error_json(&id, "dispatcher unavailable")
+                }
+                ReqOutcome::Timeout => {
+                    // 不清位：下载可能仍在 Dispatcher 中执行，AppModule 收到
+                    // Event::DownloadFinished 时统一清位（唯一清位点，见 modules.rs）。
+                    // 此前"超时即清位"会与仍在运行的下载竞态：MQTT download_begin 被误受理。
+                    error_json(&id, "download still in progress (timeout)")
+                }
             };
-            // 无论成功/失败/超时都清位，避免永久占用。
-            ui_state.lock().unwrap().downloading = false;
             resp
         }
         "unbind" => {
             log::info!("[uds] unbind: 已下发 device_unbind 上行");
             match request(ui_cmd_tx, |tx| UiCmd::Unbind { reply_tx: tx }) {
-                Some(reply) => reply_to_json(&id, reply),
-                None => error_json(&id, "dispatcher unavailable"),
+                ReqOutcome::Reply(reply) => reply_to_json(&id, reply),
+                ReqOutcome::SendFailed | ReqOutcome::Timeout => {
+                    error_json(&id, "dispatcher unavailable")
+                }
             }
         }
         "upgrade_query" => {
             // 查询固件：转发 AppModule 发布 upgrade_query 上行，服务器回包含 mcuFile/espFile/serverIp。
             match request(ui_cmd_tx, |tx| UiCmd::UpgradeQuery { reply_tx: tx }) {
-                Some(reply) => reply_to_json(&id, reply),
-                None => error_json(&id, "dispatcher unavailable"),
+                ReqOutcome::Reply(reply) => reply_to_json(&id, reply),
+                ReqOutcome::SendFailed | ReqOutcome::Timeout => {
+                    error_json(&id, "dispatcher unavailable")
+                }
             }
         }
         "upgrade" => {
@@ -193,20 +229,39 @@ fn dispatch(req: &[u8], ui_cmd_tx: &mpsc::Sender<UiCmd>, ui_state: &SharedUiStat
             // 取对应固件文件名与服务器 IP（来自此前 upgrade_query 查询结果）。
             let (fname, server_ip) = {
                 let s = ui_state.lock().unwrap();
-                let f = if file_type == 2 { s.firmware_esp_file.clone() } else { s.firmware_mcu_file.clone() };
+                let f = if file_type == 2 {
+                    s.firmware_esp_file.clone()
+                } else {
+                    s.firmware_mcu_file.clone()
+                };
                 (f, s.firmware_server_ip.clone())
             };
             if fname.is_empty() || fname == "NA" || server_ip.is_empty() {
                 ui_state.lock().unwrap().downloading = false;
-                return ok_json(&id, json!({ "err_code": 2, "msg": "no firmware / not queried" }));
+                return ok_json(
+                    &id,
+                    json!({ "err_code": 2, "msg": "no firmware / not queried" }),
+                );
             }
             // 由查询回复的 serverIp + fileName 构造 HTTP 下载地址。
             let url = format!("http://{}/{}", server_ip, fname);
-            let resp = match request(ui_cmd_tx, |tx| UiCmd::Download { file_type, file_name: fname, url: Some(url), reply_tx: tx }) {
-                Some(reply) => reply_to_json(&id, reply),
-                None => error_json(&id, "dispatcher unavailable"),
+            let resp = match request(ui_cmd_tx, |tx| UiCmd::Download {
+                file_type,
+                file_name: fname,
+                url: Some(url),
+                reply_tx: tx,
+            }) {
+                ReqOutcome::Reply(reply) => reply_to_json(&id, reply),
+                ReqOutcome::SendFailed => {
+                    // Dispatcher 已退出、命令未执行：回滚忙标志（不会有 DownloadFinished 事件）。
+                    ui_state.lock().unwrap().downloading = false;
+                    error_json(&id, "dispatcher unavailable")
+                }
+                ReqOutcome::Timeout => {
+                    // 不清位（同 "download" 分支）：固件下载可能仍在执行，由 AppModule 统一清位。
+                    error_json(&id, "download still in progress (timeout)")
+                }
             };
-            ui_state.lock().unwrap().downloading = false;
             resp
         }
         other => error_json(&id, &format!("unknown method: {other}")),
@@ -214,15 +269,28 @@ fn dispatch(req: &[u8], ui_cmd_tx: &mpsc::Sender<UiCmd>, ui_state: &SharedUiStat
 }
 
 /// 构造 reply 通道，将 `UiCmd` 发给 Dispatcher 并等待结果（60s 超时）。
-fn request<F>(ui_cmd_tx: &mpsc::Sender<UiCmd>, build: F) -> Option<UiReply>
+enum ReqOutcome {
+    Reply(UiReply),
+    /// Dispatcher 线程已退出（发送失败）：命令必定未被执行。
+    SendFailed,
+    /// 60s 内无回包：命令可能仍在执行（如大文件下载），不能据此判定失败/回滚。
+    /// （Receiver Disconnected 同样按此处理：无法确证命令未启动。）
+    Timeout,
+}
+
+fn request<F>(ui_cmd_tx: &mpsc::Sender<UiCmd>, build: F) -> ReqOutcome
 where
     F: FnOnce(mpsc::Sender<UiReply>) -> UiCmd,
 {
     let (tx, rx) = mpsc::channel::<UiReply>();
     if ui_cmd_tx.send(build(tx)).is_err() {
-        return None;
+        return ReqOutcome::SendFailed;
     }
-    rx.recv_timeout(Duration::from_secs(60)).ok()
+    match rx.recv_timeout(Duration::from_secs(60)) {
+        Ok(reply) => ReqOutcome::Reply(reply),
+        Err(mpsc::RecvTimeoutError::Timeout) => ReqOutcome::Timeout,
+        Err(mpsc::RecvTimeoutError::Disconnected) => ReqOutcome::Timeout,
+    }
 }
 
 fn reply_to_json(id: &str, reply: UiReply) -> Vec<u8> {
@@ -264,9 +332,16 @@ fn read_frame(stream: &mut UnixStream) -> Result<Option<Vec<u8>>, String> {
 /// 写一帧：`[u32 LE 长度][payload]`。
 fn write_frame(stream: &mut UnixStream, payload: &[u8]) -> std::io::Result<()> {
     if payload.len() > MAX_MSG_LEN {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "payload too large"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "payload too large",
+        ));
     }
-    log::debug!("[uds] >> send ({}B): {}", payload.len(), String::from_utf8_lossy(payload));
+    log::debug!(
+        "[uds] >> send ({}B): {}",
+        payload.len(),
+        String::from_utf8_lossy(payload)
+    );
     let len = (payload.len() as u32).to_le_bytes();
     stream.write_all(&len)?;
     stream.write_all(payload)?;

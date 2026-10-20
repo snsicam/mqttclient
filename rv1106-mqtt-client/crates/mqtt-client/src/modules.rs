@@ -6,22 +6,33 @@
 //! - `on_tick`：消费事件、心跳/周期状态上报、FIFO 出队发布；
 //! - `needs_immediate_publish`：有事件/待发包时立即发布。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use serde_json::json;
 
 use embassy_time::Duration;
-use myrtio_mqtt::runtime::{MqttModule, Publish, PublishOutbox, TopicCollector};
 use myrtio_mqtt::QoS;
+use myrtio_mqtt::runtime::{MqttModule, Publish, PublishOutbox, TopicCollector};
 
 use crate::app_state::AppState;
 use crate::config::AppConfig;
 use crate::downlink::{DownlinkCmd, UiReply};
 use crate::protocol::{self, DownlinkMsg, UplinkMsg};
-use crate::state::{ConnState, ConnStateMachine, Event, FifoItem, MAX_LOGIN_ATTEMPTS, SharedUiState, UplinkFifo, UNBOUND_RETRY_INTERVAL_SECS};
+use crate::state::{
+    ConnState, ConnStateMachine, Event, FifoItem, MAX_LOGIN_ATTEMPTS, SharedUiState,
+    UNBOUND_RETRY_INTERVAL_SECS, UplinkFifo,
+};
 
 const UPLINK_FIFO_CAP: usize = 10;
+/// 单次 on_tick 最多出队的 FIFO 包数。
+/// myrtio-mqtt 的 BufferedOutbox 容量为 8（OUTBOX_CAPACITY），同一 tick 内状态包
+/// （publish_status_packs 最多 4 包）与 FIFO 出队共享该 outbox，超量的包会被
+/// outbox **静默丢弃**（publisher.rs "queue full, silently dropped"）。此前 FIFO
+/// 全量出队（≤10）叠加状态包可一次塞 14 包 → 溢出丢包且无日志。限流为 4 保证
+/// 4+4≤8 不溢出；未出队完时保持 force_publish=true，下一 tick（~500ms）续传。
+const FIFO_DRAIN_PER_TICK: usize = 4;
 const TICK_INTERVAL: Duration = Duration::from_millis(500);
 const STATUS_IDLE_INTERVAL_SECS: u64 = 5 * 60;
 const STATUS_BUSY_INTERVAL_SECS: u64 = 10;
@@ -121,6 +132,11 @@ pub struct AppModule {
     force_publish: bool,
     /// 解绑上行绕过"未绑定不发布"守卫（见 Event::UiUnbind 处理）。
     force_unbind_publish: bool,
+    /// 会话级终止标志（与 main.rs 的 reconnect_req 同一实例）：login 重试超限进入
+    /// Reconnecting 后置位，`MqttRuntime::run_until` 在循环顶部检测到即结束本次会话
+    /// 并立即重连。否则 TCP 靠 keepalive 存活、但不再 login/上报——"已连接但哑掉"，
+    /// 直到 TCP 恰好出错才被动重建（原缺陷：should_reconnect 无任何调用点）。
+    abort: Arc<AtomicBool>,
 }
 
 impl AppModule {
@@ -130,6 +146,7 @@ impl AppModule {
         event_rx: Arc<Mutex<mpsc::Receiver<Event>>>,
         cmd_tx: mpsc::Sender<DownlinkCmd>,
         ui_state: SharedUiState,
+        abort: Arc<AtomicBool>,
     ) -> Self {
         Self {
             cfg,
@@ -142,6 +159,7 @@ impl AppModule {
             mods: BizModules::default(),
             force_publish: false,
             force_unbind_publish: false,
+            abort,
         }
     }
 
@@ -149,7 +167,9 @@ impl AppModule {
     /// 并立即上报。正常结束（2/3）或非调平中时不动作；看门狗触发后清除计时，
     /// 下次调平重新计时。
     fn leveling_watchdog(&mut self) {
-        let Some(started) = self.mods.status.leveling_started_at else { return };
+        let Some(started) = self.mods.status.leveling_started_at else {
+            return;
+        };
         let force_fail = {
             let s = self.state.lock().unwrap();
             s.leveling_status == 1 && started.elapsed() > LEVELING_WATCHDOG
@@ -173,8 +193,18 @@ impl AppModule {
 
     /// 发布并记录调试日志（topic + payload 文本）。
     fn publish_dbg(&self, outbox: &mut dyn PublishOutbox, topic: &str, payload: &[u8]) {
-        log::info!("UP   topic={topic} qos=AtLeastOnce payload={}",
-            String::from_utf8_lossy(payload));
+        log::info!(
+            "UP   topic={topic} qos=AtLeastOnce payload={}",
+            String::from_utf8_lossy(payload)
+        );
+        // myrtio-mqtt BufferedOutbox 对超长 payload 静默丢弃（OUTBOX_PAYLOAD_SIZE=1024），
+        // 此处显式告警以便发现（如超长文件列表被整包丢弃）。
+        if payload.len() > 1024 {
+            log::error!(
+                "publish payload {}B > outbox cap 1024B, packet will be silently dropped",
+                payload.len()
+            );
+        }
         outbox.publish(topic, payload, QoS::AtLeastOnce);
     }
 
@@ -230,7 +260,12 @@ impl AppModule {
                     self.ui_state.lock().unwrap().moonraker_connected = false;
                 }
                 Event::GcodeResult { cmd_type, result } => {
-                    self.enqueue( UplinkMsg::gcode_reply(&self.cfg.device.id, &cmd_type, &result, now));
+                    self.enqueue(UplinkMsg::gcode_reply(
+                        &self.cfg.device.id,
+                        &cmd_type,
+                        &result,
+                        now,
+                    ));
                 }
                 Event::UpgradeQueryRequested { reply_tx } => {
                     // UI 经 UDS 发起固件查询：发布 upgrade_query 上行，并暂存回复通道待服务器回包。
@@ -244,8 +279,16 @@ impl AppModule {
                     if self.mods.upgrade.result_seq == seq {
                         if let Some(tx) = self.mods.upgrade.pending_reply.take() {
                             let ui = self.ui_state.lock().unwrap();
-                            let mcu = if ui.firmware_mcu_file == "NA" { "" } else { ui.firmware_mcu_file.as_str() };
-                            let esp = if ui.firmware_esp_file == "NA" { "" } else { ui.firmware_esp_file.as_str() };
+                            let mcu = if ui.firmware_mcu_file == "NA" {
+                                ""
+                            } else {
+                                ui.firmware_mcu_file.as_str()
+                            };
+                            let esp = if ui.firmware_esp_file == "NA" {
+                                ""
+                            } else {
+                                ui.firmware_esp_file.as_str()
+                            };
                             let _ = tx.send(UiReply::Ok(json!({
                                 "server_ip": ui.firmware_server_ip,
                                 "mcu_file": mcu,
@@ -254,23 +297,53 @@ impl AppModule {
                         }
                     }
                 }
-                Event::DownloadStarted { file_type, file_name } => {
+                Event::DownloadStarted {
+                    file_type,
+                    file_name,
+                } => {
                     // 协议 §5.5：设备→服务器 `download_begin`（受理 transState=OK / errCode=0）。
-                    self.enqueue( UplinkMsg::download_report(&self.cfg.device.id, "download_begin", &file_name, file_type, "OK", 0, now));
+                    self.enqueue(UplinkMsg::download_report(
+                        &self.cfg.device.id,
+                        "download_begin",
+                        &file_name,
+                        file_type,
+                        "OK",
+                        0,
+                        now,
+                    ));
                 }
-                Event::DownloadFinished { file_type, file_name, err_code, from_ui } => {
-                    // 忙闲标志归属（AV-1）：MQTT 触发（from_ui=false）在此清位；UDS 触发
-                    // （from_ui=true）由 UDS 线程在回包/超时后清位，避免双重清位竞争。
-                    if !from_ui {
-                        self.ui_state.lock().unwrap().downloading = false;
-                        self.mods.download.active = None;
-                    }
+                Event::DownloadFinished {
+                    file_type,
+                    file_name,
+                    err_code,
+                    from_ui,
+                } => {
+                    // 忙闲标志唯一清位点：无论来源（MQTT/UDS）下载结束（含失败）统一在
+                    // 此清位。UDS 侧 60s 等待超时**不清位**（uds.rs）：下载可能仍在
+                    // Dispatcher 中执行，超时即清位会让并发的 MQTT download_begin 被
+                    // 误受理，begin/end 配对错乱（原缺陷 AV-1 的超时分支）。from_ui 仅供溯源。
+                    let _ = from_ui;
+                    self.ui_state.lock().unwrap().downloading = false;
+                    self.mods.download.active = None;
                     // 无论来源均上报 download_end（两条路径 begin→end 配对）。
                     // 协议 errCode 仅定义 0/1/2；内部扩展值（3=传输超限、4=不支持 file_type）
                     // 统一映射为 1（协议内"错误"），严格符合字段范围（MXS V2.1.2 §5.6）。
-                    let err_code = match err_code { 0 => 0, 1 => 1, 2 => 2, _ => 1 };
+                    let err_code = match err_code {
+                        0 => 0,
+                        1 => 1,
+                        2 => 2,
+                        _ => 1,
+                    };
                     let st = if err_code == 0 { "OK" } else { "ERROR" };
-                    self.enqueue( UplinkMsg::download_report(&self.cfg.device.id, "download_end", &file_name, file_type, st, err_code, now));
+                    self.enqueue(UplinkMsg::download_report(
+                        &self.cfg.device.id,
+                        "download_end",
+                        &file_name,
+                        file_type,
+                        st,
+                        err_code,
+                        now,
+                    ));
                 }
                 Event::UiUnbind => {
                     // UI 经 UDS 发起的解绑：组 device_unbind 上行并强制发布（绕过"未绑定不发布"守卫）。
@@ -290,16 +363,33 @@ impl AppModule {
                     // App 按规范等待 fileIndex=1..pages 的包，一个都等不到 → 列表永远显示不出来。
                     let total = files.len();
                     if total == 0 {
-                        self.enqueue( UplinkMsg::file_list_reply(&self.cfg.device.id, 0, 0, &[], now));
+                        self.enqueue(UplinkMsg::file_list_reply(
+                            &self.cfg.device.id,
+                            0,
+                            0,
+                            &[],
+                            now,
+                        ));
                     } else {
                         let pages = total.div_ceil(10);
                         for (i, chunk) in files.chunks(10).enumerate() {
-                            self.enqueue( UplinkMsg::file_list_reply(&self.cfg.device.id, pages, i + 1, chunk, now));
+                            self.enqueue(UplinkMsg::file_list_reply(
+                                &self.cfg.device.id,
+                                pages,
+                                i + 1,
+                                chunk,
+                                now,
+                            ));
                         }
                     }
                 }
                 Event::Alarm { err_type, err_msg } => {
-                    self.enqueue( UplinkMsg::alarm(&self.cfg.device.id, err_type, &err_msg, now));
+                    self.enqueue(UplinkMsg::alarm(
+                        &self.cfg.device.id,
+                        err_type,
+                        &err_msg,
+                        now,
+                    ));
                 }
             }
         }
@@ -363,12 +453,28 @@ impl AppModule {
                 };
                 if busy {
                     log::warn!("download_begin rejected: another download in progress");
-                    self.enqueue( UplinkMsg::download_report(&self.cfg.device.id, "download_begin", &fname, ft, "ERROR", 1, now));
+                    self.enqueue(UplinkMsg::download_report(
+                        &self.cfg.device.id,
+                        "download_begin",
+                        &fname,
+                        ft,
+                        "ERROR",
+                        1,
+                        now,
+                    ));
                     return;
                 }
                 self.mods.download.active = Some((ft, fname.clone()));
                 // 受理即回 download_begin(transState=OK, errCode=0)（协议 §5.5）
-                self.enqueue( UplinkMsg::download_report(&self.cfg.device.id, "download_begin", &fname, ft, "OK", 0, now));
+                self.enqueue(UplinkMsg::download_report(
+                    &self.cfg.device.id,
+                    "download_begin",
+                    &fname,
+                    ft,
+                    "OK",
+                    0,
+                    now,
+                ));
                 let fname_for_err = fname.clone();
                 if let Err(e) = self.cmd_tx.send(DownlinkCmd::DownloadBegin {
                     file_type: ft,
@@ -380,7 +486,15 @@ impl AppModule {
                     // 入队失败：清位并回 ERROR，避免卡死后续下载。
                     self.ui_state.lock().unwrap().downloading = false;
                     self.mods.download.active = None;
-                    self.enqueue( UplinkMsg::download_report(&self.cfg.device.id, "download_begin", &fname_for_err, ft, "ERROR", 1, now));
+                    self.enqueue(UplinkMsg::download_report(
+                        &self.cfg.device.id,
+                        "download_begin",
+                        &fname_for_err,
+                        ft,
+                        "ERROR",
+                        1,
+                        now,
+                    ));
                 }
             }
             "download_end" => {
@@ -462,10 +576,12 @@ impl MqttModule for AppModule {
     }
 
     fn on_message(&mut self, message: &Publish<'_>) {
-        log::info!("DOWN topic={} qos={:?} payload={}",
+        log::info!(
+            "DOWN topic={} qos={:?} payload={}",
             message.topic,
             message.qos,
-            String::from_utf8_lossy(message.payload));
+            String::from_utf8_lossy(message.payload)
+        );
         match DownlinkMsg::parse(message.payload) {
             Ok(msg) => self.handle_downlink(&msg),
             Err(e) => log::warn!("bad downlink payload: {e}"),
@@ -485,10 +601,19 @@ impl MqttModule for AppModule {
         //    避免仅靠 keepalive 断线才重登导致期间不登录）；重试超限再标记错误由断线重连。
         if self.conn.login_reply_timeout(now) {
             if self.conn.login_attempts >= MAX_LOGIN_ATTEMPTS {
-                log::warn!("login reply timeout after {} attempts, force reconnect", self.conn.login_attempts);
+                log::warn!(
+                    "login reply timeout after {} attempts, force reconnect",
+                    self.conn.login_attempts
+                );
                 self.conn.on_error();
+                // 置位会话终止标志（见 abort 字段注释）：结束本会话并立即重连，
+                // 避免 Reconnecting"僵尸态"下连接存活但设备完全静默。
+                self.abort.store(true, Ordering::SeqCst);
             } else {
-                log::warn!("login reply timeout, resend login (attempt {})", self.conn.login_attempts + 1);
+                log::warn!(
+                    "login reply timeout, resend login (attempt {})",
+                    self.conn.login_attempts + 1
+                );
                 let ip = local_ip().unwrap_or_default();
                 let payload = UplinkMsg::login(&self.cfg.device, &ip, now);
                 let topic = self.cfg.up_topic();
@@ -503,7 +628,10 @@ impl MqttModule for AppModule {
         //     不计入 login_attempts / should_reconnect，不会触发断线重连。
         if self.conn.state == ConnState::Ready && !self.conn.bound {
             if now.saturating_sub(self.conn.last_unbound_retry_ts) >= UNBOUND_RETRY_INTERVAL_SECS {
-                log::info!("unbound: resend login (polling every {}s)", UNBOUND_RETRY_INTERVAL_SECS);
+                log::info!(
+                    "unbound: resend login (polling every {}s)",
+                    UNBOUND_RETRY_INTERVAL_SECS
+                );
                 let ip = local_ip().unwrap_or_default();
                 let payload = UplinkMsg::login(&self.cfg.device, &ip, now);
                 let topic = self.cfg.up_topic();
@@ -518,7 +646,8 @@ impl MqttModule for AppModule {
         if self.mods.status.dirty
             && self.conn.state == ConnState::Ready
             && self.conn.bound
-            && now.saturating_sub(self.conn.last_status_publish_ts) >= DIRTY_PUBLISH_MIN_INTERVAL_SECS
+            && now.saturating_sub(self.conn.last_status_publish_ts)
+                >= DIRTY_PUBLISH_MIN_INTERVAL_SECS
         {
             self.mods.status.dirty = false;
             log::info!("status dirty: publish status packs now");
@@ -539,7 +668,11 @@ impl MqttModule for AppModule {
         // 4. 周期状态上报（忙 10s / 闲 5min）
         if self.conn.state == ConnState::Ready && self.conn.bound {
             let busy = self.state.lock().unwrap().is_busy();
-            let interval = if busy { STATUS_BUSY_INTERVAL_SECS } else { STATUS_IDLE_INTERVAL_SECS };
+            let interval = if busy {
+                STATUS_BUSY_INTERVAL_SECS
+            } else {
+                STATUS_IDLE_INTERVAL_SECS
+            };
             if now.saturating_sub(self.conn.last_status_publish_ts) >= interval {
                 self.publish_status_packs(outbox);
                 self.conn.last_status_publish_ts = now;
@@ -554,11 +687,19 @@ impl MqttModule for AppModule {
         // `force_unbind_publish` 例外：UI 经 UDS 发起的解绑包需绕过该守卫强制发出。
         if self.conn.bound || self.force_unbind_publish {
             let topic = self.cfg.up_topic();
-            while let Some(item) = self.fifo.pop() {
+            // 限流出队（见 FIFO_DRAIN_PER_TICK 注释）：每 tick 最多出队 4 包，
+            // 防止叠加状态包后超出 outbox 容量 8 而被静默丢弃。
+            for _ in 0..FIFO_DRAIN_PER_TICK {
+                let Some(item) = self.fifo.pop() else { break };
                 self.publish_dbg(outbox, &topic, &item.payload);
             }
-            self.force_publish = false;
-            self.force_unbind_publish = false;
+            if self.fifo.is_empty() {
+                self.force_publish = false;
+                self.force_unbind_publish = false;
+            } else {
+                // FIFO 未排空：保持立即发布意愿，下一 tick 续传余量。
+                self.force_publish = true;
+            }
         }
 
         TICK_INTERVAL
@@ -599,7 +740,11 @@ mod tests {
     #[test]
     fn file_list_paging_matches_spec() {
         let (mut m, tx) = test_module();
-        let mk = |n: usize| (0..n).map(|i| (format!("f{i}.gcode"), 100u64)).collect::<Vec<_>>();
+        let mk = |n: usize| {
+            (0..n)
+                .map(|i| (format!("f{i}.gcode"), 100u64))
+                .collect::<Vec<_>>()
+        };
 
         // 12 个文件 → 2 页：第一页 10 个（fileIndex=1），第二页 2 个（fileIndex=2）
         tx.send(Event::FileListResult { files: mk(12) }).unwrap();
@@ -632,7 +777,14 @@ mod tests {
 
     fn test_module() -> (AppModule, mpsc::Sender<Event>) {
         let cfg = AppConfig {
-            device: crate::config::DeviceConfig { id: "G9".into(), mb: "M".into(), sf1: "1".into(), sf2: "2".into(), wf: "W".into(), lang: 0 },
+            device: crate::config::DeviceConfig {
+                id: "G9".into(),
+                mb: "M".into(),
+                sf1: "1".into(),
+                sf2: "2".into(),
+                wf: "W".into(),
+                lang: 0,
+            },
             mqtt: crate::config::MqttConfig::default(),
             moonraker: crate::config::MoonrakerConfig::default(),
             download: crate::config::DownloadConfig::default(),
@@ -643,7 +795,14 @@ mod tests {
         let (cmd_tx, _cmd_rx) = mpsc::channel::<DownlinkCmd>();
         let state = Arc::new(Mutex::new(AppState::default()));
         let ui_state: SharedUiState = Arc::new(Mutex::new(Default::default()));
-        let m = AppModule::new(cfg, state, Arc::new(Mutex::new(event_rx)), cmd_tx, ui_state);
+        let m = AppModule::new(
+            cfg,
+            state,
+            Arc::new(Mutex::new(event_rx)),
+            cmd_tx,
+            ui_state,
+            Arc::new(AtomicBool::new(false)),
+        );
         (m, event_tx)
     }
 
@@ -716,7 +875,11 @@ mod tests {
     fn event_gcode_result_enqueues() {
         let (mut m, tx) = test_module();
         // 通过 Sender 投递事件
-        tx.send(Event::GcodeResult { cmd_type: "M115".into(), result: "OK".into() }).unwrap();
+        tx.send(Event::GcodeResult {
+            cmd_type: "M115".into(),
+            result: "OK".into(),
+        })
+        .unwrap();
         m.drain_events();
         assert!(!m.fifo.is_empty());
         assert!(m.needs_immediate_publish());
@@ -730,7 +893,10 @@ mod tests {
         m.drain_events();
         assert_eq!(m.state.lock().unwrap().leveling_status, 1);
         assert_eq!(m.state.lock().unwrap().leveling_point, 0);
-        assert!(m.mods.status.leveling_started_at.is_some(), "应记录调平开始时刻供看门狗使用");
+        assert!(
+            m.mods.status.leveling_started_at.is_some(),
+            "应记录调平开始时刻供看门狗使用"
+        );
         assert!(m.mods.status.dirty);
         assert!(m.needs_immediate_publish());
     }
@@ -752,8 +918,15 @@ mod tests {
         m.mods.status.leveling_started_at =
             Some(std::time::Instant::now() - std::time::Duration::from_secs(31 * 60));
         m.leveling_watchdog();
-        assert_eq!(m.state.lock().unwrap().leveling_status, 3, "超时应强制置失败");
-        assert!(m.mods.status.leveling_started_at.is_none(), "触发后应清除计时");
+        assert_eq!(
+            m.state.lock().unwrap().leveling_status,
+            3,
+            "超时应强制置失败"
+        );
+        assert!(
+            m.mods.status.leveling_started_at.is_none(),
+            "触发后应清除计时"
+        );
         assert!(m.needs_immediate_publish(), "应立即上报");
 
         // 已结束（status=2）时即使残留超时时刻也不动作
@@ -761,7 +934,11 @@ mod tests {
         m.mods.status.leveling_started_at =
             Some(std::time::Instant::now() - std::time::Duration::from_secs(31 * 60));
         m.leveling_watchdog();
-        assert_eq!(m.state.lock().unwrap().leveling_status, 2, "已结束不应被看门狗改写");
+        assert_eq!(
+            m.state.lock().unwrap().leveling_status,
+            2,
+            "已结束不应被看门狗改写"
+        );
     }
 
     /// 未绑定（bindState 非 0）时不得对外发送状态包与 FIFO 包。
@@ -801,9 +978,14 @@ mod tests {
         m.conn.last_unbound_retry_ts = 0;
         let mut outbox = Recorder::default();
         m.on_tick(&mut outbox);
-        let has_login = outbox.items.iter().any(|(_t, p)| {
-            String::from_utf8_lossy(p).contains("\"type\":\"login\"")
-        });
-        assert!(has_login, "未绑定时应每 5s 轮询重发 login，实际: {:?}", outbox.items);
+        let has_login = outbox
+            .items
+            .iter()
+            .any(|(_t, p)| String::from_utf8_lossy(p).contains("\"type\":\"login\""));
+        assert!(
+            has_login,
+            "未绑定时应每 5s 轮询重发 login，实际: {:?}",
+            outbox.items
+        );
     }
 }

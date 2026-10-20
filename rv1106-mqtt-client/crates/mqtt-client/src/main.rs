@@ -6,19 +6,19 @@
 //! - dispatcher 线程：下行命令执行（Moonraker 调用 / HTTP 下载）。
 
 use std::path::Path;
-use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::Duration;
+use mqtt_client::config::{PLACEHOLDER_DEVICE_ID, device_id_from_serial, read_board_serial};
 use mqtt_client::downlink::{Dispatcher, DownlinkCmd, UiCmd};
 use mqtt_client::modules::AppModule;
 use mqtt_client::moonraker::MoonrakerWorker;
 use mqtt_client::state::{Event, SharedUiState};
 use mqtt_client::transport::StdTcpTransport;
-use mqtt_client::config::{device_id_from_serial, read_board_serial, PLACEHOLDER_DEVICE_ID};
 use mqtt_client::{AppConfig, AppState};
 use myrtio_mqtt::runtime::{MqttRuntime, PublishRequest};
 use myrtio_mqtt::{LastWill, MqttClient, MqttOptions, QoS};
@@ -158,7 +158,9 @@ fn main() {
             eprintln!("failed to write default config to {path:?}: {e}");
             std::process::exit(1);
         });
-        log::info!("default config written to {path:?}, please edit it and restart, or it will be used as-is");
+        log::info!(
+            "default config written to {path:?}, please edit it and restart, or it will be used as-is"
+        );
         // 重新读取刚写入的默认文件（确保与磁盘一致，并走标准校验路径）
         AppConfig::load(path).unwrap_or_else(|e| {
             eprintln!("config error: {e}");
@@ -187,10 +189,18 @@ fn main() {
                 log::warn!("failed to persist device.id to {path:?}: {e}");
             }
         } else {
-            log::warn!("device.id is placeholder {:?}, but no board serial found", cfg.device.id);
+            log::warn!(
+                "device.id is placeholder {:?}, but no board serial found",
+                cfg.device.id
+            );
         }
     }
-    log::info!("RV1106 MQTT client start: device={} broker={}:{}", cfg.device.id, cfg.mqtt.broker, cfg.mqtt.port);
+    log::info!(
+        "RV1106 MQTT client start: device={} broker={}:{}",
+        cfg.device.id,
+        cfg.mqtt.broker,
+        cfg.mqtt.port
+    );
 
     // 蓝牙初始化信息（AIC8800 → BlueZ hci0，应用走 D-Bus/GATT）
     mqtt_client::blufi::init::init_bluetooth(&cfg.blufi);
@@ -263,9 +273,19 @@ fn main() {
     // 进程级 'static 资源：client_id 与 publisher 通道（每次重连复用，避免泄漏）
     // 'a 需为 'static：MqttRuntime 的 client_id 借用与 publisher channel 生命周期必须一致
     let client_id: &'static str = Box::leak(cfg.device.id.clone().into_boxed_str());
-    let ch: &'static Channel<CriticalSectionRawMutex, PublishRequest<'static>, 8> = Box::leak(Box::new(Channel::new()));
+    let ch: &'static Channel<CriticalSectionRawMutex, PublishRequest<'static>, 8> =
+        Box::leak(Box::new(Channel::new()));
 
-    futures::executor::block_on(mqtt_main(cfg, app_state, event_rx, cmd_tx, ui_state, client_id, ch, reconnect_req));
+    futures::executor::block_on(mqtt_main(
+        cfg,
+        app_state,
+        event_rx,
+        cmd_tx,
+        ui_state,
+        client_id,
+        ch,
+        reconnect_req,
+    ));
 }
 
 type PublisherChannel = Channel<CriticalSectionRawMutex, PublishRequest<'static>, 8>;
@@ -287,7 +307,22 @@ async fn mqtt_main(
     //  - immediate=true（配网成功触发）：已切到新网络，立即重连并重新 login，无退避；
     //  - 其他（断网/错误）：退避 5s 后重连（原始行为，避免打爆 broker）。
     loop {
-        let (immediate, reason) = run_session(&cfg, &app_state, &event_rx, &cmd_tx, &ui_state, client_id, ch, lwt_topic, &reconnect_req).await;
+        let (immediate, reason) = run_session(
+            &cfg,
+            &app_state,
+            &event_rx,
+            &cmd_tx,
+            &ui_state,
+            client_id,
+            ch,
+            lwt_topic,
+            &reconnect_req,
+        )
+        .await;
+        // 会话结束即对 UI 下线云端状态：cloud_connected 仅由 AppModule::on_start（本会话
+        // 登录流程）置 true，退出后若不清位，5s 退避重连期间 UDS bind_status 会持续
+        // 误报"云端已连接"。
+        ui_state.lock().unwrap().cloud_connected = false;
         if immediate {
             log::info!("mqtt session ended: {reason}; re-login immediately");
         } else {
@@ -334,14 +369,26 @@ async fn run_session(
     options = options.with_credentials(username, cfg.mqtt.password.as_deref().unwrap_or(""));
     // LWT：断线遗嘱（MXS 协议 topic）。lwt_topic 由调用方在重连循环外泄漏一次，避免每 5s 重复泄漏。
     static LWT_PAYLOAD: &[u8] = b"";
-    options = options.with_last_will(LastWill { topic: lwt_topic, payload: LWT_PAYLOAD, qos: QoS::AtLeastOnce, retain: false });
+    options = options.with_last_will(LastWill {
+        topic: lwt_topic,
+        payload: LWT_PAYLOAD,
+        qos: QoS::AtLeastOnce,
+        retain: false,
+    });
 
     let client = MqttClient::<_, 4, 2048>::new(transport, options);
 
     // 发布通道（仅作 runtime 的 publisher 输入；业务发布走模块 outbox）
     let rx = ch.receiver();
 
-    let module = AppModule::new(cfg.clone(), app_state.clone(), event_rx.clone(), cmd_tx.clone(), ui_state.clone());
+    let module = AppModule::new(
+        cfg.clone(),
+        app_state.clone(),
+        event_rx.clone(),
+        cmd_tx.clone(),
+        ui_state.clone(),
+        reconnect_req.clone(),
+    );
     let mut runtime = MqttRuntime::new(client, module, rx);
     // 与「配网成功后重连」信号竞速：信号到达即丢弃当前运行 future（底层 StdTcpTransport
     // 的 TcpStream 随之关闭），本次 session 结束，mqtt_main 据 immediate 标志「立即」重连/login；
@@ -355,7 +402,9 @@ async fn run_session(
     let r = runtime.run_until(&**reconnect_req).await;
     match r {
         Ok(()) => {
-            log::info!("mqtt: wifi provisioned — re-login immediately (no backoff)");
+            log::info!(
+                "mqtt: reconnect requested (wifi provisioned or login aborted) — re-login immediately"
+            );
             (true, "reconnect requested".to_string())
         }
         Err(e) => (false, format!("runtime: {e:?}")),
