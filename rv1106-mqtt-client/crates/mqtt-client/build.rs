@@ -25,4 +25,45 @@ fn main() {
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=build.rs");
+
+    cross_link_args();
+}
+
+/// 交叉目标（armv7 + uclibc）的链接参数：
+/// - sysroot：跟随 `RV1106_TOOLCHAIN` 环境变量（与 scripts/build.sh 同一变量），
+///   缺省为 `/opt/toolchain/arm-rockchip830-linux-uclibcgnueabihf`（CI/容器标准布局）；
+/// - uclibc 缺失符号的桩库：`getauxval` / `posix_spawn*`（`<workspace>/cross/` 下预编译），
+///   经 `CARGO_MANIFEST_DIR` 定位，不再依赖机器特定绝对路径。
+/// 仅在交叉目标时生效，host 构建完全不受影响。
+fn cross_link_args() {
+    const CROSS_TARGET: &str = "armv7-unknown-linux-gnueabihf";
+    const CROSS_TRIPLE: &str = "arm-rockchip830-linux-uclibcgnueabihf";
+
+    let Ok(target) = std::env::var("TARGET") else { return };
+    if target != CROSS_TARGET {
+        return;
+    }
+
+    println!("cargo:rerun-if-env-changed=RV1106_TOOLCHAIN");
+    let toolchain_root = std::env::var("RV1106_TOOLCHAIN")
+        .unwrap_or_else(|_| format!("/opt/toolchain/{CROSS_TRIPLE}"));
+    let sysroot = std::path::Path::new(&toolchain_root)
+        .join(CROSS_TRIPLE)
+        .join("sysroot");
+    println!("cargo:rustc-link-arg=--sysroot={}", sysroot.display());
+    println!("cargo:rustc-link-arg=-L{}/usr/lib", sysroot.display());
+
+    // 桩库目录：workspace 根下的 cross/（crates/mqtt-client/../../cross）。
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
+    let cross_dir = std::path::Path::new(&manifest_dir).join("../../cross");
+    let cross_dir = cross_dir
+        .canonicalize()
+        .expect("cross/ stub dir must exist at workspace root");
+    println!("cargo:rustc-link-search=native={}", cross_dir.display());
+    // 必须用 link-arg 而非 link-lib：link-lib 会被 rustc 放在 rlib 之前，
+    // 静态库按命令行顺序解析，早于引用它的 libstd 出现则不会拉入成员，
+    // posix_spawn*/getauxval 仍为 undefined。link-arg 追加在命令行末尾
+    // （libstd 与 -lc 之后），可正确解析这些桩符号。
+    println!("cargo:rustc-link-arg=-lgetauxval");
+    println!("cargo:rustc-link-arg=-lposix_spawn");
 }

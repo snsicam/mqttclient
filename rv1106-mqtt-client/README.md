@@ -73,7 +73,7 @@ cargo test                  # 单元测试（31 例，host 原生）
 # 交叉编译到 RV1106
 # 1) 导出 Luckfox 工具链到 PATH（arm-rockchip830-linux-uclibcgnueabihf）
 export PATH=/home/song/samba/work/rv1106/luckfox-pico/tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf/bin:$PATH
-# 2) 交叉编译（已配好 .cargo/config.toml，linker + sysroot + getauxval 桩）
+# 2) 交叉编译（.cargo/config.toml 配 linker；sysroot/桩库由 crates/mqtt-client/build.rs 按 RV1106_TOOLCHAIN 生成）
 #    推荐用构建脚本（自动探测工具链、设置 linker、校验产物）：
 cargo build --release --target armv7-unknown-linux-gnueabihf
 # 或: ./scripts/build.sh release            # release 交叉编译
@@ -83,7 +83,7 @@ cargo build --release --target armv7-unknown-linux-gnueabihf
 
 > 工具链为 Luckfox Pico（RV1106）官方 `arm-rockchip830-linux-uclibcgnueabihf`（uclibc 1.0.31）。
 > Rust 无对应 uclibceabihf target，采用 `armv7-unknown-linux-gnueabihf` + uclibc gcc 作 linker/symroot。
-> 因 uclibc 1.0.31 缺失 `getauxval` 符号，已预编译 `cross/libgetauxval.a` 桩（见 `.cargo/config.toml`）。
+> 因 uclibc 1.0.31 缺失 `getauxval` 符号，已预编译 `cross/libgetauxval.a` 桩（经 `crates/mqtt-client/build.rs` 链接，无机器特定路径）。
 
 运行：`mqtt-client [配置文件路径]`，默认 `config/mqtt-client.toml`。
 
@@ -95,7 +95,7 @@ cargo build --release --target armv7-unknown-linux-gnueabihf
 | **P1b** | `MqttOptions` 支持 `clean_session`（R1 要求 Clean Session=0；原 `connect` 中写死 `true`） | `myrtio-mqtt/src/client.rs` |
 | **P2** | `embassy-net` 改为 optional（默认不启用）；`TcpTransport` 及相关导出 gate 在 `embassy-net` feature 下。本项目走 std `StdTcpTransport`，不拉入 embassy-net / embassy-executor-timer-queue | `myrtio-mqtt/Cargo.toml`、`src/transport.rs`、`src/lib.rs` |
 | **P3** | `embassy-time` 启用 `generic-queue-8`，改用通用定时器队列，避免 `embassy-time-queue-utils` 集成队列对 `__embassy_time_queue_item_from_waker`（需 embassy-executor 提供）的未定义引用 | `myrtio-mqtt/Cargo.toml` |
-| **P4** | 新增 `cross/libgetauxval.a` 桩（uclibc 1.0.31 缺失 `getauxval`），经 `.cargo/config.toml` 链接 | `cross/getauxval.c`、`cross/libgetauxval.a`、`.cargo/config.toml` |
+| **P4** | 新增 `cross/libgetauxval.a` 桩（uclibc 1.0.31 缺失 `getauxval`），经 `crates/mqtt-client/build.rs` 链接（sysroot 跟随 `RV1106_TOOLCHAIN`） | `cross/getauxval.c`、`cross/libgetauxval.a`、`crates/mqtt-client/build.rs` |
 | **P5** | 重连延时由 `embassy_time::Timer::after` 改为 `std::thread::sleep`（本项目用 `futures::block_on` 而非 embassy executor，无定时器队列驱动） | `crates/mqtt-client/src/main.rs` |
 
 > 详见 [docs/详细设计说明书.md](docs/详细设计说明书.md) §2.2 与 §14（实现偏差说明）。

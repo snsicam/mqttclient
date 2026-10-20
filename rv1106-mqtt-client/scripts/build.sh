@@ -34,7 +34,10 @@ done
 # 采用 armv7-unknown-linux-gnueabihf + uclibc gcc 作 linker/sysroot。
 # 必须用 uclibc 工具链：板子 rootfs 为 uclibc，gnu(glibc) 产物依赖 libc.so.6 /
 # ld-linux-armhf.so.3 无法运行。uclibc 缺失的 getauxval 与 posix_spawn* 辅助函数
-# 由 cross/ 下桩库补齐（libgetauxval.a / libposix_spawn.a，见 .cargo/config.toml）。
+# 由 cross/ 下桩库补齐（libgetauxval.a / libposix_spawn.a，经 crates/mqtt-client/build.rs 链接）。
+# 注意：桩库必须用 rustc-link-arg（追加在链接命令末尾，libstd/-lc 之后）而非
+# rustc-link-lib(static=)：静态库按命令行顺序解析，早于引用它的 libstd 出现则不会
+# 拉入成员，getauxval/posix_spawn* 仍为 undefined reference。
 #
 # 蓝牙（bluer → dbus-rs）：uclibc sysroot 内没有 libdbus，因此对交叉目标启用
 # dbus 的 `vendored` feature（见 crates/mqtt-client/Cargo.toml 的
@@ -63,6 +66,8 @@ fi
 if [ -n "${TOOLCHAIN_DIR:-}" ] && [ -d "$TOOLCHAIN_DIR/bin" ]; then
     export PATH="$TOOLCHAIN_DIR/bin:$PATH"
 fi
+# 传给 crates/mqtt-client/build.rs：sysroot 链接参数由此变量派生（与本次构建用同一工具链）
+export RV1106_TOOLCHAIN="$TOOLCHAIN_DIR"
 
 GCC_PATH=$(which "$GCC_NAME" 2>/dev/null || echo "")
 if [ -z "$GCC_PATH" ]; then

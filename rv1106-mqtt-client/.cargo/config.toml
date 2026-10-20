@@ -16,20 +16,16 @@
 #   - libposix_spawn.a：posix_spawn_file_actions_{init,destroy} 与
 #                       posix_spawnattr_*（这些函数在 uclibc 头文件里仅为
 #                       static inline，Rust 需要外部符号）
+#
+# sysroot 与桩库的链接参数由 crates/mqtt-client/build.rs 的 cross_link_args() 生成：
+#   - sysroot 跟随 RV1106_TOOLCHAIN 环境变量（与 scripts/build.sh 同一变量），
+#     缺省 /opt/toolchain/arm-rockchip830-linux-uclibcgnueabihf；
+#   - 桩库经 CARGO_MANIFEST_DIR 定位 workspace 的 cross/，无机器特定绝对路径。
+# 此处只保留与工具链无关的 rustflags。
 
 [target.armv7-unknown-linux-gnueabihf]
 linker = "arm-rockchip830-linux-uclibcgnueabihf-gcc"
 rustflags = [
   "-C", "linker-flavor=gcc",
   "-C", "target-cpu=cortex-a7",
-  "-C", "link-arg=--sysroot=/opt/toolchain/arm-rockchip830-linux-uclibcgnueabihf/arm-rockchip830-linux-uclibcgnueabihf/sysroot",
-  "-C", "link-arg=-L/opt/toolchain/arm-rockchip830-linux-uclibcgnueabihf/arm-rockchip830-linux-uclibcgnueabihf/sysroot/usr/lib",
-  # 桩库目录
-  "-C", "link-arg=-L/home/song/samba/work/project/klipper/mqttclient/rv1106-mqtt-client/cross",
-  "-C", "link-arg=-lgetauxval",
-  "-C", "link-arg=-lposix_spawn",
 ]
-
-[build]
-# 确保工具链在 PATH 中（若未全局安装，可在此用 target.<triple> 的 linker 绝对路径，
-# 或 source 工具链 env）。此处依赖 linker 名称已在 PATH。
