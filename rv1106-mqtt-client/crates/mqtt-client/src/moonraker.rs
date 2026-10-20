@@ -83,7 +83,15 @@ impl MoonrakerClient {
 
     /// 建立连接：blocking TCP + WS 握手（读超时保护），成功后转非阻塞。
     pub fn connect(&mut self) -> Result<(), String> {
-        let stream = std::net::TcpStream::connect((self.cfg.host.as_str(), self.cfg.port))
+        // connect_timeout：Moonraker 宕机/不可达时避免阻塞式 connect 挂起 ~2min
+        // （期间 moonraker 线程完全停摆），与 MQTT 侧 StdTcpTransport 的做法对齐。
+        use std::net::ToSocketAddrs;
+        let addr = (self.cfg.host.as_str(), self.cfg.port)
+            .to_socket_addrs()
+            .map_err(|e| format!("resolve: {e}"))?
+            .next()
+            .ok_or_else(|| "resolve: no address".to_string())?;
+        let stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))
             .map_err(|e| format!("tcp connect: {e}"))?;
         stream.set_read_timeout(Some(Duration::from_secs(3))).map_err(|e| e.to_string())?;
         let url = format!("ws://{}:{}/websocket", self.cfg.host, self.cfg.port);
@@ -587,9 +595,11 @@ fn parse_probe_count(v: &Value) -> Option<u8> {
     Some(((x * y) as usize).min(255) as u8)
 }
 
-/// 从 `printer.objects.list` 结果中筛出可订阅对象：对象名精确命中或首词命中
+/// 从 `printer.objects.list` 结果中筛出可订阅对象：对象名首词命中
 /// SUBSCRIBE_OBJECTS（如 "heater_fan main_fan" → 首词 heater_fan）。返回实际
 /// 存在的对象名——订阅裸名 "heater_fan" 在 Klipper 中同样会被整体拒绝。
+/// 宏对象（如 "gcode_macro MXXX"）首词不在清单内，不会被误订（预热状态由
+/// 目标温度派生，不依赖任何宏）。
 fn subscription_subset(list_result: &Value) -> Vec<String> {
     list_result
         .get("objects")
@@ -606,6 +616,7 @@ fn subscription_subset(list_result: &Value) -> Vec<String> {
 
 pub mod state_bridge {
     use super::*;
+    use crate::gcode_translator::PREHEAT_PRESETS;
 
     /// 将 notify_status_update 的对象表写入 AppState。
     pub fn apply(s: &mut AppState, map: &Map<String, Value>) {
@@ -616,10 +627,12 @@ pub mod state_bridge {
                 "extruder" => {
                     num(attrs, "temperature", &mut s.nozzle_actual);
                     num(attrs, "target", &mut s.nozzle_target);
+                    refresh_temp_state(s);
                 }
                 "heater_bed" => {
                     num(attrs, "temperature", &mut s.bed_actual);
                     num(attrs, "target", &mut s.bed_target);
+                    refresh_temp_state(s);
                 }
                 "fan" => pct(attrs, "speed", &mut s.main_fan_pct),
                 "heater_fan" => pct(attrs, "speed", &mut s.board_fan_pct),
@@ -729,6 +742,30 @@ pub mod state_bridge {
                 _ => {}
             }
         }
+    }
+
+    /// 由喷嘴/热床目标派生 status_temp_fan 的预热相关字段（对齐 M2 屏幕材料表）：
+    /// - `preheat_type`：两目标同时命中 [`PREHEAT_PRESETS`] → 索引+1
+    ///   （1=PLA 180/60 / 2=ABS 220/80 / 3=PETG 230/85）；否则 0（目标 >0 但不匹配
+    ///   预设 = "正在加热"，不算某材料预热）；
+    /// - `preheat_state`：命中材料预设即 1（正在预热），否则 0；
+    /// - `heat_state`：喷嘴或热床目标 >0 即 1（对齐 M2 `flag_heat`）。
+    ///
+    /// 全程由目标温度派生、无需记忆，故设备重启后（目标仍在）也能正确恢复显示。
+    fn refresh_temp_state(s: &mut AppState) {
+        s.heat_state = if s.nozzle_target > 0.0 || s.bed_target > 0.0 { 1 } else { 0 };
+        let (ext, bed) = (s.nozzle_target as i64, s.bed_target as i64);
+        let mut material = 0u8;
+        if ext > 0 || bed > 0 {
+            for (i, (pe, pb)) in PREHEAT_PRESETS.iter().enumerate() {
+                if ext == *pe && bed == *pb {
+                    material = i as u8 + 1;
+                    break;
+                }
+            }
+        }
+        s.preheat_type = material;
+        s.preheat_state = if material > 0 { 1 } else { 0 };
     }
 
     fn num(m: &Map<String, Value>, k: &str, out: &mut f64) {
@@ -917,6 +954,60 @@ mod tests {
         assert!(f("!! Klipper shutdown: MCU 'probe' shutdown"));
         assert!(!f("!! M420: unknown parameter 'S'"), "无关命令报错不判调平失败");
         assert!(!f("!! Extrude below minimum temp"));
+    }
+
+    /// 回归：宏对象（"gcode_macro MXXX"）不得被订阅——其首词不在清单内，
+    /// 若按首词泛匹配会把板端全部宏一并订上。
+    #[test]
+    fn subscription_subset_excludes_macros() {
+        let list = json!({
+            "objects": ["extruder", "gcode_macro M145", "gcode_macro M201",
+                        "gcode_macro M600", "gcode_macro START_PRINT", "bed_mesh"]
+        });
+        let subs = subscription_subset(&list);
+        assert!(subs.iter().any(|s| s == "extruder"));
+        assert!(subs.iter().any(|s| s == "bed_mesh"));
+        assert!(!subs.iter().any(|s| s.starts_with("gcode_macro")), "不应订阅任何宏");
+    }
+
+    /// 预热状态由喷嘴/热床目标温度派生（预设对齐 M2 屏幕：PLA 180/60、ABS 220/80、
+    /// PETG 230/85；heatState 对齐 M2 flag_heat）：命中预设 → preheatType=索引+1、
+    /// preheatState=1；目标>0 但不匹配 → 类型 0 但 heatState=1（"正在加热"）；
+    /// 目标归零 → 全部 0。
+    #[test]
+    fn bridge_preheat_derived_from_targets() {
+        let mut s = AppState::default();
+        // PLA（180/60）→ 类型 1
+        state_bridge::apply(&mut s, json!({
+            "extruder": {"temperature": 25.0, "target": 180.0},
+            "heater_bed": {"temperature": 25.0, "target": 60.0},
+        }).as_object().unwrap());
+        assert_eq!((s.preheat_type, s.preheat_state, s.heat_state), (1, 1, 1));
+
+        // ABS（220/80）→ 类型 2
+        state_bridge::apply(&mut s, json!({
+            "extruder": {"target": 220.0}, "heater_bed": {"target": 80.0},
+        }).as_object().unwrap());
+        assert_eq!((s.preheat_type, s.preheat_state, s.heat_state), (2, 1, 1));
+
+        // PETG（230/85）→ 类型 3
+        state_bridge::apply(&mut s, json!({
+            "extruder": {"target": 230.0}, "heater_bed": {"target": 85.0},
+        }).as_object().unwrap());
+        assert_eq!((s.preheat_type, s.preheat_state, s.heat_state), (3, 1, 1));
+
+        // 目标 >0 但不匹配任何预设（如 200/50 或切片 start-gcode 自定义温度）→ "正在加热"
+        state_bridge::apply(&mut s, json!({
+            "extruder": {"target": 200.0}, "heater_bed": {"target": 50.0},
+        }).as_object().unwrap());
+        assert_eq!((s.preheat_type, s.preheat_state, s.heat_state), (0, 0, 1));
+
+        // 冷却（S0）：目标归零 → 全部 0
+        state_bridge::apply(&mut s, json!({
+            "extruder": {"temperature": 120.0, "target": 0.0},
+            "heater_bed": {"temperature": 40.0, "target": 0.0},
+        }).as_object().unwrap());
+        assert_eq!((s.preheat_type, s.preheat_state, s.heat_state), (0, 0, 0));
     }
 
     #[test]

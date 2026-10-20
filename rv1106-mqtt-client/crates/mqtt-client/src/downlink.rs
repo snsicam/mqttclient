@@ -7,7 +7,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::config::AppConfig;
-use crate::gcode_translator::{GcodeKind, translate};
+use crate::gcode_translator::{GcodeKind, PreheatTarget, PREHEAT_PRESETS, translate};
 use crate::moonraker::MrHandle;
 use crate::state::Event;
 
@@ -181,6 +181,30 @@ impl Dispatcher {
                     }
                     Err(e) => format!("ERR: {e}"),
                 }
+            }
+            // M145 一键预热/冷却：协议下行只带材料索引，温度由设备端预设表决定
+            // （PREHEAT_PRESETS，对齐 M2 屏幕材料表：PLA 180/60、ABS 220/80、PETG 230/85）。
+            // 动作用 SET_HEATER_TEMPERATURE 直接设喷嘴/热床目标温度，不经 Klipper 宏。
+            GcodeKind::Preheat(PreheatTarget::Cool) => self.script(
+                "SET_HEATER_TEMPERATURE HEATER=extruder TARGET=0\n\
+                 SET_HEATER_TEMPERATURE HEATER=heater_bed TARGET=0",
+            ),
+            GcodeKind::Preheat(PreheatTarget::Material(idx)) => {
+                let (ext, bed) = PREHEAT_PRESETS[idx as usize];
+                self.script(&format!(
+                    "SET_HEATER_TEMPERATURE HEATER=extruder TARGET={ext}\n\
+                     SET_HEATER_TEMPERATURE HEATER=heater_bed TARGET={bed}"
+                ))
+            }
+            // 越界（S4+ / 无 S）：回 OK 且发 alarm errType=12
+            // （ERR_PREHEAT_OUT，m2 wifi_module.cpp case 145；文案与 M2 屏幕材料表一致）。
+            // 不下发、不改温度。
+            GcodeKind::Preheat(PreheatTarget::Invalid) => {
+                let _ = self.event_tx.send(Event::Alarm {
+                    err_type: 12,
+                    err_msg: "Index: 1-PLA, 2-ABS, 3-PETG".into(),
+                });
+                "OK".into()
             }
             GcodeKind::PrintStart(file) => match self.mr.request("printer.print.start", json!({ "filename": file }), Duration::from_secs(10)) {
                 Ok(_) => "File selected OK".into(),
