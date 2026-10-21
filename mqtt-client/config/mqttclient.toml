@@ -25,8 +25,8 @@ port = 1883
 keepalive_secs = 60
 # Clean Session=0：保持会话，重连后可收到离线 QoS1 消息
 clean_session = false
-# 认证（可选）
-# username 默认 = 设备 id（G+12 位数字序列号，动态生成）；如需固定账号可显式覆盖：
+# 认证：平台默认 username=设备 id（动态生成）、password=空字符串
+# 绝大多数部署无需改动以下两行；仅当平台分配了固定账号时才显式覆盖：
 # username = "G102732598375"
 # password = "secret"
 

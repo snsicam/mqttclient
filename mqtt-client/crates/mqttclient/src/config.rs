@@ -154,8 +154,10 @@ pub struct MqttConfig {
     /// Clean Session：false = 保持会话（协议要求 Clean Session 0）。
     #[serde(default)]
     pub clean_session: bool,
+    /// MQTT 用户名（可选）。None 时运行时自动取 device.id 作为平台认证用户名。
     #[serde(default)]
     pub username: Option<String>,
+    /// MQTT 密码（可选）。None 时运行时自动用空字符串——平台默认密码为空。
     #[serde(default)]
     pub password: Option<String>,
     /// 设备型号：构成 topic `GT/{model}/UP|DOWN|LWT/{deviceId}`。
@@ -194,7 +196,7 @@ pub struct DownloadConfig {
 impl Default for MqttConfig {
     fn default() -> Self {
         Self {
-            broker: "121.199.168.145".into(),
+            broker: "124.221.175.240".into(),
             port: 1883,
             keepalive_secs: 60,
             clean_session: false,
