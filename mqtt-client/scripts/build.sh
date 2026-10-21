@@ -185,6 +185,9 @@ if [ "$DEPLOY" = true ]; then
     DEPLOY_PATH="${DEPLOY_PATH:-/opt/mqttclient/mqttclient}"
     echo ""
     echo "[4/4][Deploy] Copying to RV1106 ($RV1106_HOST:$DEPLOY_PATH)..."
+    # 首次部署或路径变更时（如 rv1106-mqtt-client → mqtt-client 重命名后），
+    # 板端目标目录可能尚不存在，先 mkdir -p 保证父目录就绪
+    _rv_ssh "mkdir -p '$(dirname "$DEPLOY_PATH")'"
     # 运行中的二进制不可直接覆盖（ETXTBSY）：先传 .new，再原子 mv 落位
     _rv_scp "$BIN_PATH" "$DEPLOY_PATH.new"
     _rv_ssh "mv -f '$DEPLOY_PATH.new' '$DEPLOY_PATH' && chmod 755 '$DEPLOY_PATH' && md5sum '$DEPLOY_PATH'"
