@@ -3,5 +3,5 @@
 	url = git@github.com:snsicam/myrtio-mqtt.git
 
 [submodule "bluer"]
-	path = rv1106-mqtt-client/bluer
+	path = mqtt-client/bluer
 	url = git@github.com:snsicam/bluer.git
