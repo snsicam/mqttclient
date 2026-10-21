@@ -6,12 +6,17 @@
 #   ./scripts/build.sh release         # 交叉编译 release 版本 (--release)
 #   ./scripts/build.sh deploy          # debug 编译 + scp 到板子
 #   ./scripts/build.sh release deploy  # release 编译 + scp 到板子
+#   ./scripts/build.sh release install # release 编译 + 装进 buildroot overlay
 #
 # 环境变量:
-#   RV1106_HOST       — RV1106 的 IP (deploy 用, 默认 192.168.1.100)
+#   RV1106_HOST       — RV1106 的 IP (deploy 用, 默认 192.168.0.30)
+#   RV1106_PASS       — 板端 root 密码 (deploy 用；设置后经 expect 自动应答，
+#                       不设置则 scp/ssh 交互式提示输入。密码不写入本脚本)
 #   RV1106_TOOLCHAIN  — Rockchip uclibc 工具链 bin 目录 (默认见下)
-#   DEPLOY_PATH       — 板子上部署路径 (默认 /usr/bin/mqtt-client)
+#   DEPLOY_PATH       — 板子上部署路径 (默认 /opt/mqtt-client/mqtt-client)
 #   CARGO_TARGET_DIR  — 覆盖编译输出目录 (默认 workspace/target)
+#   SDK_ROOT          — RV1106 SDK 根 (install 用, 默认见下)
+#   INSTALL_DIR       — install 目标目录 (默认 SDK overlay/opt/mqtt-client)
 
 set -euo pipefail
 
@@ -21,10 +26,12 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # ---- 解析参数 ----
 RELEASE=false
 DEPLOY=false
+INSTALL=false
 for arg in "$@"; do
     case "$arg" in
         release) RELEASE=true ;;
         deploy)  DEPLOY=true ;;
+        install) INSTALL=true ;;
         *) echo "[ERROR] Unknown arg: $arg"; exit 1 ;;
     esac
 done
@@ -51,6 +58,64 @@ TOOLCHAIN_DIR="${RV1106_TOOLCHAIN:-/opt/toolchain/arm-rockchip830-linux-uclibcgn
 BIN_NAME="mqtt-client"
 OUT_DIR="$PROJECT_ROOT/target/$TARGET"
 BIN_PATH="$OUT_DIR/$( [ "$RELEASE" = true ] && echo release || echo debug )/$BIN_NAME"
+
+# SDK 根：默认 RV1106 IPC SDK（仅 install 用；可用 SDK_ROOT= 覆盖）
+SDK_ROOT="${SDK_ROOT:-/home/song/samba/work/rv1106/rk-sdk/RV1106_IPC_SDK}"
+# 安装目录 = buildroot overlay 源目录（随 rootfs 一起打包进镜像）
+# 板端启动脚本 /opt/S25mqttclient 在 /opt/mqtt-client 下运行 ./mqtt-client。
+OVERLAY_DIR="${INSTALL_DIR:-$SDK_ROOT/project/cfg/BoardConfig_IPC/overlay/overlay-gt-buildroot-app/opt/mqtt-client}"
+
+# ---- 板端访问（deploy 用）----
+# 设置了 RV1106_PASS 时用 expect 自动应答密码（密码经环境变量交给 Tcl，
+# 不写进脚本正文）；未设置则退回 scp/ssh 原生交互输入。
+export RV1106_HOST="${RV1106_HOST:-192.168.0.30}"
+export RV1106_PASS="${RV1106_PASS:-}"
+RV_SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
+
+_need_expect() {
+    command -v expect >/dev/null 2>&1 || {
+        echo "[ERROR] 已设置 RV1106_PASS，但未安装 expect" >&2
+        return 1
+    }
+}
+
+# 上传文件：$1=本地路径 $2=板端路径
+_rv_scp() {
+    if [ -n "$RV1106_PASS" ]; then
+        _need_expect || return 1
+        RV_SRC="$1" RV_DST="$2" expect -c '
+            set timeout 300
+            spawn scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $env(RV_SRC) root@$env(RV1106_HOST):$env(RV_DST)
+            expect {
+                -re {(?i)password:} { send "$env(RV1106_PASS)\r"; exp_continue }
+                eof
+            }
+            catch wait result
+            exit [lindex $result 3]
+        '
+    else
+        scp "${RV_SSH_OPTS[@]}" "$1" "root@$RV1106_HOST:$2"
+    fi
+}
+
+# 板端执行命令：$1=远端 shell 命令
+_rv_ssh() {
+    if [ -n "$RV1106_PASS" ]; then
+        _need_expect || return 1
+        RV_CMD="$1" expect -c '
+            set timeout 120
+            spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@$env(RV1106_HOST) $env(RV_CMD)
+            expect {
+                -re {(?i)password:} { send "$env(RV1106_PASS)\r"; exp_continue }
+                eof
+            }
+            catch wait result
+            exit [lindex $result 3]
+        '
+    else
+        ssh "${RV_SSH_OPTS[@]}" "root@$RV1106_HOST" "$1"
+    fi
+}
 
 cd "$PROJECT_ROOT"
 
@@ -117,11 +182,32 @@ ls -lh "$BIN_PATH"
 
 # ---- deploy 模式 ----
 if [ "$DEPLOY" = true ]; then
-    RV1106_HOST="${RV1106_HOST:-192.168.1.100}"
-    DEPLOY_PATH="${DEPLOY_PATH:-/usr/bin/mqtt-client}"
+    DEPLOY_PATH="${DEPLOY_PATH:-/opt/mqtt-client/mqtt-client}"
     echo ""
-    echo "[4/4][Deploy] Copying to RV1106 ($RV1106_HOST)..."
-    scp "$BIN_PATH" "root@$RV1106_HOST:$DEPLOY_PATH"
-    echo "[Deploy] Done. Run on RV1106:"
-    echo "  mqtt-client [config-path]   # 默认 /etc/mqtt-client.toml 或 ./config/mqtt-client.toml"
+    echo "[4/4][Deploy] Copying to RV1106 ($RV1106_HOST:$DEPLOY_PATH)..."
+    # 运行中的二进制不可直接覆盖（ETXTBSY）：先传 .new，再原子 mv 落位
+    _rv_scp "$BIN_PATH" "$DEPLOY_PATH.new"
+    _rv_ssh "mv -f '$DEPLOY_PATH.new' '$DEPLOY_PATH' && chmod 755 '$DEPLOY_PATH' && md5sum '$DEPLOY_PATH'"
+    echo "[Deploy] Done. 重启客户端使其生效:"
+    echo "  ssh root@$RV1106_HOST 'kill \$(pidof mqtt-client); cd /opt/mqtt-client && setsid nohup ./mqtt-client >> /root/printer_data/logs/mqtt-client.log 2>&1 &'"
+fi
+
+# ---- install 模式：装进 buildroot overlay（随 rootfs 打包进镜像）----
+if [ "$INSTALL" = true ]; then
+    OVERLAY_PARENT="$(dirname "$OVERLAY_DIR")"
+    if [ ! -d "$OVERLAY_PARENT" ]; then
+        echo "[ERROR] overlay 父目录不存在: $OVERLAY_PARENT"
+        echo "  请确认 SDK 结构（或设置 INSTALL_DIR）"
+        exit 1
+    fi
+    echo ""
+    echo "[4/4][Install] Copying to overlay ($OVERLAY_DIR)..."
+    mkdir -p "$OVERLAY_DIR"
+    cp "$BIN_PATH" "$OVERLAY_DIR/$BIN_NAME"
+    chmod 755 "$OVERLAY_DIR/$BIN_NAME"
+    echo "[Install] Done."
+    ls -lh "$OVERLAY_DIR/$BIN_NAME"
+    echo
+    echo "  下一步: 重新打包 rootfs，烧录后板端即为 /opt/mqtt-client/mqtt-client"
+    echo "  注: 设备专属配置 config/mqtt-client.toml 不由本脚本覆盖（由出厂/配网流程生成）"
 fi
