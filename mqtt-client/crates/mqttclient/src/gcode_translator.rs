@@ -51,20 +51,18 @@ fn mcode(cmd: &str) -> Option<(u32, &str)> {
     Some((code, rest[end..].trim_start()))
 }
 
-/// 取首个参数并清理引号/尖括号（文件路径）。
-fn first_token(s: &str) -> String {
-    let s = s.trim_start();
-    // 支持引号包裹的含空格路径：M32 "my file.gcode"（此前只取首词，文件名被截断）。
+/// 取文件参数（M32/M30）：Marlin 语义下文件名是命令剩余全部内容，
+/// 支持引号包裹；去除 `;` 注释与首尾空白。App 下发的含空格文件名不
+/// 加引号（M32 Desk Oragnizer xxx.gcode），必须整体保留——此前按首词
+/// 截断导致 "Unable to open file"。
+fn file_arg(s: &str) -> String {
+    let s = s.split(';').next().unwrap_or("").trim();
     if let Some(rest) = s.strip_prefix('"') {
         if let Some(end) = rest.find('"') {
             return rest[..end].to_string();
         }
     }
-    s.split_whitespace()
-        .next()
-        .unwrap_or("")
-        .trim_matches(['"', '\'', '<', '>'])
-        .to_string()
+    s.trim_matches(['"', '\'', '<', '>']).to_string()
 }
 
 /// 取单字母参数值（如 `rest="S190"` → `Some("190")`），大小写与空格不敏感。
@@ -128,8 +126,8 @@ pub fn translate(cmd: &str) -> GcodeKind {
     }
 
     match mcode(trimmed) {
-        Some((32, rest)) => GcodeKind::PrintStart(first_token(rest)),
-        Some((30, rest)) => GcodeKind::DeleteFile(first_token(rest)),
+        Some((32, rest)) => GcodeKind::PrintStart(file_arg(rest)),
+        Some((30, rest)) => GcodeKind::DeleteFile(file_arg(rest)),
         // M145：一键预热/冷却。协议下行只带材料索引（不含温度），客户端按
         // M2 屏幕材料预设表下发 SET_HEATER_TEMPERATURE 设目标温度（见 downlink.rs）。
         Some((145, rest)) => GcodeKind::Preheat(preheat_target(rest)),
@@ -171,6 +169,29 @@ mod tests {
             GcodeKind::Unsupported(_)
         ));
         assert!(matches!(translate("M29"), GcodeKind::Unsupported(_)));
+    }
+
+    #[test]
+    fn translate_filename_with_spaces() {
+        // App 下发的含空格文件名不加引号：必须整体保留，不得按首词截断
+        assert_eq!(
+            translate("M32 Desk Oragnizer 60percent_PLA_57m28s.gcode"),
+            GcodeKind::PrintStart("Desk Oragnizer 60percent_PLA_57m28s.gcode".into())
+        );
+        assert_eq!(
+            translate("M30 Mobile phone holder_PLA_39m30s.gcode"),
+            GcodeKind::DeleteFile("Mobile phone holder_PLA_39m30s.gcode".into())
+        );
+        // 引号包裹形式兼容
+        assert_eq!(
+            translate("M32 \"my file.gcode\""),
+            GcodeKind::PrintStart("my file.gcode".into())
+        );
+        // `;` 注释剔除
+        assert_eq!(
+            translate("M32 my file.gcode ;start"),
+            GcodeKind::PrintStart("my file.gcode".into())
+        );
     }
 
     #[test]

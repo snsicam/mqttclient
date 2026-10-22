@@ -55,6 +55,12 @@ pub struct Dispatcher {
     gcode_root: Option<String>,
 }
 
+/// 文件名归一化：所有 Unicode 空白（含 NBSP U+00A0）归为普通空格并折叠
+/// 连续空白（`split_whitespace` 按 Unicode White_Space 切分，天然覆盖）。
+fn normalize_name(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 impl Dispatcher {
     pub fn spawn(
         cfg: AppConfig,
@@ -206,10 +212,13 @@ impl Dispatcher {
                 });
                 "OK".into()
             }
-            GcodeKind::PrintStart(file) => match self.mr.request("printer.print.start", json!({ "filename": file }), Duration::from_secs(10)) {
-                Ok(_) => "File selected OK".into(),
-                Err(e) => format!("File open failed: {e}"),
-            },
+            GcodeKind::PrintStart(file) => {
+                let file = self.resolve_filename(&file);
+                match self.mr.request("printer.print.start", json!({ "filename": file }), Duration::from_secs(10)) {
+                    Ok(_) => "File selected OK".into(),
+                    Err(e) => format!("File open failed: {e}"),
+                }
+            }
             GcodeKind::Resume => self.print_ctrl("printer.print.resume"),
             GcodeKind::Pause => self.print_ctrl("printer.print.pause"),
             GcodeKind::Cancel => self.print_ctrl("printer.print.cancel"),
@@ -218,7 +227,10 @@ impl Dispatcher {
                 let _ = self.event_tx.send(Event::FileListResult { files });
                 "OK".into()
             }
-            GcodeKind::DeleteFile(file) => self.delete_file(&file),
+            GcodeKind::DeleteFile(file) => {
+                let f = self.resolve_filename(&file);
+                self.delete_file(&f)
+            }
             GcodeKind::Unsupported(s) => format!("ERR: unsupported: {s}"),
         }
     }
@@ -290,6 +302,31 @@ impl Dispatcher {
                 out
             }
             Err(_) => Vec::new(),
+        }
+    }
+
+    /// 打印/删除前解析真实文件名：App 下发的文件名空白字符与磁盘实际
+    /// 文件名可能不一致（云切片文件名含 NBSP U+00A0，App 侧被规范为
+    /// 普通空格），与 Moonraker 文件列表做归一化匹配，唯一命中返回磁盘
+    /// 真实名；未命中/多命中返回原名透传（维持原报错行为，不劣化）。
+    fn resolve_filename(&mut self, name: &str) -> String {
+        let want = normalize_name(name);
+        if want.is_empty() {
+            return name.to_string();
+        }
+        let matches: Vec<String> = self
+            .list_files()
+            .into_iter()
+            .map(|(p, _)| p)
+            .filter(|p| normalize_name(p) == want)
+            .collect();
+        if matches.len() == 1 {
+            if matches[0] != name {
+                log::info!("resolve_filename: {:?} -> {:?}", name, matches[0]);
+            }
+            matches.into_iter().next().unwrap()
+        } else {
+            name.to_string()
         }
     }
 
@@ -465,5 +502,18 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn normalize_name_nbsp_and_folding() {
+        // NBSP（\u{a0}，云切片文件名常见）与普通空格归一后相等
+        assert_eq!(
+            normalize_name("Desk\u{a0}Oragnizer\u{a0}60percent_PLA_57m28s.gcode"),
+            "Desk Oragnizer 60percent_PLA_57m28s.gcode"
+        );
+        // 连续空白折叠、首尾空白剔除
+        assert_eq!(normalize_name("  a   b\tc.gcode "), "a b c.gcode");
+        // 无空白原样
+        assert_eq!(normalize_name("x.gcode"), "x.gcode");
     }
 }
