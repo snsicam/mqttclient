@@ -273,7 +273,14 @@ async fn serve(
     );
 
     // 广播包只声明 ServiceUUIDs=[0xFFFF]（供 APP 扫描阶段识别 BluFi），
-    // 设备名交给 BlueZ 填进 adv / scan response（过长会自动进 scan response）。
+    // 设备名交给 BlueZ 填进 scan response（Complete Local Name，≤29 字节）。
+    //
+    // 不可设 discoverable：BlueZ 对 discoverable 的广告会把 LocalName 塞进
+    // 广播 PDU 本体（adv_data，advertising.c add_name），而 128-bit UUID 已占
+    // 18/31 字节，名字放不进去时被截成 Shortened（≈10 字节，实测手机交替
+    // 扫到短名 M1S-G10116 与全名）；不设 discoverable 时名字才进 scan
+    // response（与 bt_ble_up.sh 的 `name $NAME` 一致）。BluFi 配网按 UUID
+    // 过滤，不依赖 discoverable 位。
     //
     // `advertise=false` 时不注册广播（由系统侧负责），只注册 GATT 应用；
     // 默认 `advertise=true`（见 `BluFiConfig::default_advertise`），由本应用自广播，
@@ -283,13 +290,14 @@ async fn serve(
         let le_advertisement = Advertisement {
             advertisement_type: AdvType::Peripheral,
             service_uuids: BTreeSet::from([SVC_UUID]),
-            discoverable: Some(true),
-            local_name: Some(local_name),
+            discoverable: None,
+            local_name: Some(local_name.clone()),
             ..Default::default()
         };
         match adapter.advertise(le_advertisement).await {
             Ok(handle) => {
                 log::info!("bluetooth: LE advertisement registered (ServiceUUIDs=[0xFFFF])");
+                spawn_full_name_scan_rsp(local_name);
                 Some(handle)
             }
             Err(e) => {
@@ -431,4 +439,55 @@ async fn notify_session(
         }
     }
     log::info!("bluetooth: notify session stop");
+}
+
+/// AIC8800D 固件缺陷规避：host 侧（BlueZ mgmt → 该固件的 extended
+/// advertising 路径）从不下发 scan response 数据（HCI 层观察不到
+/// 0x2038/0x2009），scannable 广播收到 scan request 时固件用 controller
+/// 名按 Shortened Local Name 规则截 10 字节自动组包，手机扫描因此在
+/// 固件短名（M1S-G10116）与 BR/EDR EIR 全名之间来回跳变（2026-10-22 实测
+/// 确认，手工写全名后跳变消失）。
+///
+/// 这里在广播注册成功后，对所有现存 advertising handle 显式写入全名
+/// scan response（HCI LE Set Extended Scan Response Data, opcode 0x2038）
+/// 覆盖固件默认行为；handle 不存在时固件返回 0x42（Unknown Advertising
+/// Identifier），忽略即可。延迟 8s 以等系统侧其它广播实例（bt_ble_up.sh
+/// 的 NUS）也注册完一并覆盖。
+fn spawn_full_name_scan_rsp(local_name: String) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+        let name_bytes = local_name.as_bytes();
+        if name_bytes.len() > 29 {
+            return;
+        }
+        // AD 结构: [len, 0x09 Complete Local Name, name...]，31 字节对齐补零
+        let mut data = [0u8; 31];
+        data[0] = (name_bytes.len() + 1) as u8;
+        data[1] = 0x09;
+        data[2..2 + name_bytes.len()].copy_from_slice(name_bytes);
+        for handle in 0u8..=3u8 {
+            let payload: Vec<u8> = [handle, 0x03, 0x01, (name_bytes.len() + 2) as u8]
+                .into_iter()
+                .chain(data)
+                .collect();
+            let args: Vec<String> = ["-i", "hci0", "cmd", "0x08", "0x0038"]
+                .into_iter()
+                .map(String::from)
+                .chain(payload.iter().map(|b| format!("0x{b:02x}")))
+                .collect();
+            match std::process::Command::new("hcitool").args(&args).output() {
+                Ok(out) => {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    log::info!(
+                        "bluetooth: scan_rsp handle={handle} 写入全名: {}",
+                        text.lines().last().unwrap_or("").trim()
+                    );
+                }
+                Err(e) => {
+                    log::warn!("bluetooth: 无法执行 hcitool 写 scan response: {e}");
+                    break;
+                }
+            }
+        }
+    });
 }
